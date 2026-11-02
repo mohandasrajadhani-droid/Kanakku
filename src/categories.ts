@@ -34,9 +34,29 @@ export const CATEGORIES: Category[] = [
 export const EXPENSE_CATEGORIES = CATEGORIES.filter(c => !c.income);
 export const INCOME_CATEGORIES = CATEGORIES.filter(c => c.income);
 
+/** Categories the user created; kept in storage and registered at start-up. */
+export interface CustomCategory { name: string; icon: string; color: string; income: boolean; custom: true }
+
+export const CUSTOM_ICONS = ['🏠', '👨‍👩‍👧', '🎁', '🙏', '🐄', '🌾', '🔧', '🚿', '👕', '💇', '🏋️', '✈️', '🎓', '🏥', '🧾', '📦', '💰', '🏢', '🪙', '📊', '🤝', '🏧', '⭐', '📌'];
+export const CUSTOM_COLORS = ['#E0A458', '#9CB86B', '#7FB2C9', '#C98BB9', '#D9734E', '#6FC2A6', '#B497D6', '#E8C872', '#8C9EDB', '#C47A6B'];
+
 const byName: Record<string, Category> = Object.fromEntries(CATEGORIES.map(c => [c.name, c]));
+let customByName: Record<string, Category> = {};
+
+export function registerCustom(list: CustomCategory[]) {
+  customByName = Object.fromEntries(list.map(c => [c.name, { ...c, keywords: [] }]));
+}
+export function isBuiltIn(name: string) {
+  return !!byName[name];
+}
 export function catMeta(name: string): Category {
-  return byName[name] || byName.Others;
+  return byName[name] || customByName[name] || byName.Others;
+}
+export function expenseList(custom: CustomCategory[]): Category[] {
+  return [...EXPENSE_CATEGORIES, ...custom.filter(c => !c.income).map(c => ({ ...c, keywords: [] }))];
+}
+export function incomeList(custom: CustomCategory[]): Category[] {
+  return [...INCOME_CATEGORIES, ...custom.filter(c => c.income).map(c => ({ ...c, keywords: [] }))];
 }
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

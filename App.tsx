@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, FlatList, Modal, Pressable, ScrollView, Share,
+  ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Share,
   StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { parseSms, Txn } from './src/parser';
-import { catMeta, EXPENSE_CATEGORIES, INCOME_CATEGORIES } from './src/categories';
+import {
+  Category, catMeta, CUSTOM_COLORS, CUSTOM_ICONS, CustomCategory, expenseList, incomeList, isBuiltIn, registerCustom,
+} from './src/categories';
 import { ensureSmsPermission, readInbox } from './src/sms';
-import { applyRule, loadAll, mergeTxns, Rules, saveLastScan, saveRules, saveTxns } from './src/storage';
+import { applyRule, loadAll, mergeTxns, Rules, saveCats, saveLastScan, saveRules, saveTxns } from './src/storage';
 import { ago, C, fmtDate, fmtDay, inr, monthLabel } from './src/ui';
 
 const DAY = 86400000;
@@ -47,6 +49,8 @@ function Main() {
   const [catFilter, setCatFilter] = useState<string | null>(null);
   const [selected, setSelected] = useState<Txn | null>(null);
   const [adding, setAdding] = useState(false);
+  const [managing, setManaging] = useState(false);
+  const [cats, setCats] = useState<CustomCategory[]>([]);
 
   const runScan = useCallback(async (base: Txn[], baseRules: Rules, baseLast: number, silent: boolean) => {
     setScanning(true);
@@ -76,7 +80,8 @@ function Main() {
   useEffect(() => {
     (async () => {
       const d = await loadAll();
-      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan);
+      registerCustom(d.cats);
+      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats);
       setReady(true);
       if (d.lastScan) runScan(d.txns, d.rules, d.lastScan, true);
     })();
@@ -108,13 +113,43 @@ function Main() {
 
   const deleteTxn = async (id: string) => { await persist(txns.filter(t => t.id !== id)); setSelected(null); };
 
-  const addCash = async (amount: number, note: string, category: string) => {
+  const addEntry = async (type: 'debit' | 'credit', amount: number, note: string, category: string) => {
     const t: Txn = {
-      id: `cash-${Date.now()}`, date: Date.now(), amount, type: 'debit', merchant: note || 'Cash expense',
+      id: `cash-${Date.now()}`, date: Date.now(), amount, type,
+      merchant: note || (type === 'debit' ? 'Cash expense' : 'Cash received'),
       mode: 'Cash', category, manual: true,
     };
     await persist([t, ...txns]);
     setAdding(false);
+  };
+
+  const addCategory = async (c: CustomCategory): Promise<boolean> => {
+    const name = c.name.trim();
+    const clash = isBuiltIn(name) || cats.some(x => x.name.toLowerCase() === name.toLowerCase());
+    if (!name || clash) {
+      Alert.alert(clash ? 'Category already exists' : 'Enter a name');
+      return false;
+    }
+    const next = [...cats, { ...c, name }];
+    registerCustom(next); setCats(next); await saveCats(next);
+    return true;
+  };
+
+  const deleteCategory = (c: CustomCategory) => {
+    const used = txns.filter(t => t.category === c.name).length;
+    const fallback = c.income ? 'Received' : 'Others';
+    Alert.alert(`Delete “${c.name}”?`, used ? `${used} entr${used > 1 ? 'ies' : 'y'} will move to ${fallback}.` : undefined, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive', onPress: async () => {
+          const next = cats.filter(x => x.name !== c.name);
+          const r = Object.fromEntries(Object.entries(rules).filter(([, v]) => v !== c.name));
+          registerCustom(next); setCats(next); setRules(r);
+          await Promise.all([saveCats(next), saveRules(r)]);
+          await persist(txns.map(t => (t.category === c.name ? { ...t, category: fallback } : t)));
+        },
+      },
+    ]);
   };
 
   const monthTx = useMemo(() => {
@@ -231,6 +266,9 @@ function Main() {
               <Btn label="Export month (CSV)" onPress={exportCsv} />
             </View>
           )}
+          <View style={s.btnRow}>
+            <Btn label="Manage categories" onPress={() => setManaging(true)} />
+          </View>
         </ScrollView>
       ) : (
         <View style={s.fill}>
@@ -251,7 +289,7 @@ function Main() {
       )}
 
       <Pressable style={[s.fab, { bottom: 76 + insets.bottom }]} onPress={() => setAdding(true)}>
-        <Text style={s.fabText}>＋ Cash</Text>
+        <Text style={s.fabText}>＋ Add</Text>
       </Pressable>
 
       <View style={[s.tabs, { paddingBottom: insets.bottom + 6 }]}>
@@ -259,8 +297,9 @@ function Main() {
         <TabBtn label="Transactions" on={tab === 'txns'} onPress={() => setTab('txns')} />
       </View>
 
-      <TxnModal t={selected} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
-      <CashModal visible={adding} onClose={() => setAdding(false)} onSave={addCash} />
+      <TxnModal t={selected} cats={cats} onAddCat={addCategory} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
+      <EntryModal visible={adding} cats={cats} onAddCat={addCategory} onClose={() => setAdding(false)} onSave={addEntry} />
+      <CategoriesModal visible={managing} cats={cats} onAdd={addCategory} onDelete={deleteCategory} onClose={() => setManaging(false)} />
     </View>
   );
 }
@@ -286,87 +325,186 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
   );
 }
 
-function TxnModal({ t, onClose, onUpdate, onDelete }: {
-  t: Txn | null; onClose: () => void;
-  onUpdate: (id: string, p: Partial<Txn>, remember: boolean) => void; onDelete: (id: string) => void;
+/** Bottom sheet that stays above the keyboard and the phone's navigation bar; buttons sit in a fixed footer. */
+function Sheet({ visible, onClose, children, footer }: {
+  visible: boolean; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode;
 }) {
-  const [remember, setRemember] = useState(true);
-  if (!t) return null;
-  const cats = t.type === 'credit' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES;
+  const insets = useSafeAreaInsets();
   return (
-    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={s.backdrop} onPress={onClose} />
-      <View style={s.sheet}>
-        <ScrollView>
-          <Text style={s.sheetAmt}>{t.type === 'credit' ? '+' : '−'}{inr(t.amount, true)}</Text>
-          <Text style={s.h2}>{t.merchant}</Text>
-          <Text style={s.mute}>
-            {fmtDate(t.date)} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}{t.ref ? `\nRef ${t.ref}` : ''}
-          </Text>
-
-          <Text style={[s.label, { marginTop: 18 }]}>CATEGORY</Text>
-          <View style={s.catGrid}>
-            {cats.map(c => (
-              <Chip key={c.name} label={`${c.icon} ${c.name}`} on={t.category === c.name}
-                onPress={() => onUpdate(t.id, { category: c.name, ...(c.name === 'Card Bill' ? { excluded: true } : {}) }, remember)} />
-            ))}
-          </View>
-          {!t.manual && (
-            <View style={s.switchRow}>
-              <Text style={s.body}>Use this category for all “{t.merchant}” payments</Text>
-              <Switch value={remember} onValueChange={setRemember} thumbColor={remember ? C.gold : '#888'} trackColor={{ true: C.goldDeep, false: C.line }} />
-            </View>
-          )}
-          <View style={s.switchRow}>
-            <Text style={s.body}>Leave out of totals{'\n'}<Text style={s.mute}>For self-transfers or card bills</Text></Text>
-            <Switch value={!!t.excluded} onValueChange={v => onUpdate(t.id, { excluded: v }, false)} thumbColor={t.excluded ? C.gold : '#888'} trackColor={{ true: C.goldDeep, false: C.line }} />
-          </View>
-
-          {t.body && (
-            <>
-              <Text style={[s.label, { marginTop: 14 }]}>ORIGINAL MESSAGE</Text>
-              <Text style={s.smsBox}>{t.body}</Text>
-            </>
-          )}
-          <View style={s.btnRow}>
-            {t.manual && <Btn label="Delete" onPress={() => onDelete(t.id)} danger />}
-            <Btn label="Done" onPress={onClose} primary />
-          </View>
-        </ScrollView>
-      </View>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <Pressable style={s.backdrop} onPress={onClose} />
+        <View style={[s.sheet, { paddingBottom: insets.bottom + 14 }]}>
+          <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
+          {footer && <View style={s.footer}>{footer}</View>}
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 }
 
-function CashModal({ visible, onClose, onSave }: { visible: boolean; onClose: () => void; onSave: (a: number, n: string, c: string) => void }) {
+/** Inline form to create a category; used inside pickers and the manage screen. */
+function NewCategoryForm({ income, onAdd, onDone, allowTypeSwitch }: {
+  income: boolean; onAdd: (c: CustomCategory) => Promise<boolean>; onDone: (name?: string) => void; allowTypeSwitch?: boolean;
+}) {
+  const [name, setName] = useState('');
+  const [icon, setIcon] = useState(CUSTOM_ICONS[0]);
+  const [isIncome, setIsIncome] = useState(income);
+  const save = async () => {
+    const color = CUSTOM_COLORS[Math.floor(Math.random() * CUSTOM_COLORS.length)];
+    const ok = await onAdd({ name, icon, color, income: isIncome, custom: true });
+    if (ok) { onDone(name.trim()); setName(''); }
+  };
+  return (
+    <View style={s.newForm}>
+      {allowTypeSwitch && (
+        <View style={[s.catGrid, { marginBottom: 10 }]}>
+          <Chip label="Expense" on={!isIncome} onPress={() => setIsIncome(false)} />
+          <Chip label="Income" on={isIncome} onPress={() => setIsIncome(true)} />
+        </View>
+      )}
+      <TextInput style={s.input} placeholder={isIncome ? 'Income category (e.g. Rent received)' : 'Expense category (e.g. House rent)'}
+        placeholderTextColor={C.mute} value={name} onChangeText={setName} maxLength={24} />
+      <View style={[s.catGrid, { gap: 4 }]}>
+        {CUSTOM_ICONS.map(i => (
+          <Pressable key={i} onPress={() => setIcon(i)} style={[s.iconCell, icon === i && { borderColor: C.gold, backgroundColor: C.card }]}>
+            <Text style={{ fontSize: 20 }}>{i}</Text>
+          </Pressable>
+        ))}
+      </View>
+      <View style={s.btnRow}>
+        <Btn label="Cancel" onPress={() => onDone()} />
+        <Btn label="Add category" onPress={save} primary />
+      </View>
+    </View>
+  );
+}
+
+/** Category chips plus a "＋ New" chip that opens the inline form. */
+function CategoryPicker({ list, value, income, onPick, onAddCat }: {
+  list: Category[]; value: string; income: boolean; onPick: (name: string) => void; onAddCat: (c: CustomCategory) => Promise<boolean>;
+}) {
+  const [creating, setCreating] = useState(false);
+  return (
+    <>
+      <View style={s.catGrid}>
+        {list.map(c => <Chip key={c.name} label={`${c.icon} ${c.name}`} on={value === c.name} onPress={() => onPick(c.name)} />)}
+        {!creating && <Chip label="＋ New" onPress={() => setCreating(true)} />}
+      </View>
+      {creating && (
+        <NewCategoryForm income={income} onAdd={onAddCat} onDone={n => { setCreating(false); if (n) onPick(n); }} />
+      )}
+    </>
+  );
+}
+
+function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
+  t: Txn | null; cats: CustomCategory[]; onAddCat: (c: CustomCategory) => Promise<boolean>; onClose: () => void;
+  onUpdate: (id: string, p: Partial<Txn>, remember: boolean) => void; onDelete: (id: string) => void;
+}) {
+  const [remember, setRemember] = useState(true);
+  if (!t) return null;
+  const income = t.type === 'credit';
+  const list = income ? incomeList(cats) : expenseList(cats);
+  return (
+    <Sheet visible onClose={onClose} footer={<>
+      {t.manual && <Btn label="Delete" onPress={() => onDelete(t.id)} danger />}
+      <Btn label="Done" onPress={onClose} primary />
+    </>}>
+      <Text style={s.sheetAmt}>{income ? '+' : '−'}{inr(t.amount, true)}</Text>
+      <Text style={s.h2}>{t.merchant}</Text>
+      <Text style={s.mute}>
+        {fmtDate(t.date)} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}{t.ref ? `\nRef ${t.ref}` : ''}
+      </Text>
+
+      <Text style={[s.label, { marginTop: 18 }]}>CATEGORY</Text>
+      <CategoryPicker list={list} value={t.category} income={income} onAddCat={onAddCat}
+        onPick={name => onUpdate(t.id, { category: name, ...(name === 'Card Bill' ? { excluded: true } : {}) }, remember)} />
+      {!t.manual && (
+        <View style={s.switchRow}>
+          <Text style={s.body}>Use this category for all “{t.merchant}” entries</Text>
+          <Switch value={remember} onValueChange={setRemember} thumbColor={remember ? C.gold : '#888'} trackColor={{ true: C.goldDeep, false: C.line }} />
+        </View>
+      )}
+      <View style={s.switchRow}>
+        <Text style={s.body}>Leave out of totals{'\n'}<Text style={s.mute}>For self-transfers or card bills</Text></Text>
+        <Switch value={!!t.excluded} onValueChange={v => onUpdate(t.id, { excluded: v }, false)} thumbColor={t.excluded ? C.gold : '#888'} trackColor={{ true: C.goldDeep, false: C.line }} />
+      </View>
+
+      {t.body && (
+        <>
+          <Text style={[s.label, { marginTop: 14 }]}>ORIGINAL MESSAGE</Text>
+          <Text style={s.smsBox}>{t.body}</Text>
+        </>
+      )}
+    </Sheet>
+  );
+}
+
+function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
+  visible: boolean; cats: CustomCategory[]; onAddCat: (c: CustomCategory) => Promise<boolean>; onClose: () => void;
+  onSave: (type: 'debit' | 'credit', a: number, n: string, c: string) => void;
+}) {
+  const [type, setType] = useState<'debit' | 'credit'>('debit');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [cat, setCat] = useState('Food & Dining');
+  const income = type === 'credit';
+  const list = (income ? incomeList(cats) : expenseList(cats)).filter(c => !['Card Bill', 'Cash Withdrawal'].includes(c.name));
+  const switchType = (t: 'debit' | 'credit') => { setType(t); setCat(t === 'credit' ? 'Received' : 'Food & Dining'); };
   const save = () => {
     const a = parseFloat(amount.replace(/,/g, ''));
     if (!(a > 0)) { Alert.alert('Enter an amount'); return; }
-    onSave(a, note.trim(), cat);
+    onSave(type, a, note.trim(), cat);
     setAmount(''); setNote('');
   };
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={s.backdrop} onPress={onClose} />
-      <View style={s.sheet}>
-        <Text style={s.h2}>Cash expense</Text>
-        <TextInput style={s.input} placeholder="Amount (₹)" placeholderTextColor={C.mute} keyboardType="decimal-pad" value={amount} onChangeText={setAmount} autoFocus />
-        <TextInput style={s.input} placeholder="What for? (e.g. Vegetables)" placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
-        <View style={s.catGrid}>
-          {EXPENSE_CATEGORIES.filter(c => !['Card Bill', 'Cash Withdrawal'].includes(c.name)).map(c => (
-            <Chip key={c.name} label={`${c.icon} ${c.name}`} on={cat === c.name} onPress={() => setCat(c.name)} />
-          ))}
-        </View>
-        <Text style={[s.mute, { marginTop: 8 }]}>Tip: mark ATM withdrawals “Leave out of totals” if you log cash spends here, so cash isn’t counted twice.</Text>
-        <View style={s.btnRow}>
-          <Btn label="Cancel" onPress={onClose} />
-          <Btn label="Save" onPress={save} primary />
-        </View>
+    <Sheet visible={visible} onClose={onClose} footer={<>
+      <Btn label="Cancel" onPress={onClose} />
+      <Btn label="Save" onPress={save} primary />
+    </>}>
+      <Text style={s.h2}>Add entry</Text>
+      <View style={[s.catGrid, { marginBottom: 12 }]}>
+        <Chip label="Paid" on={!income} onPress={() => switchType('debit')} />
+        <Chip label="Received" on={income} onPress={() => switchType('credit')} />
       </View>
-    </Modal>
+      <TextInput style={s.input} placeholder="Amount (₹)" placeholderTextColor={C.mute} keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
+      <TextInput style={s.input} placeholder={income ? 'From / what for? (e.g. Rent)' : 'What for? (e.g. Vegetables)'} placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
+      <Text style={s.label}>CATEGORY</Text>
+      <CategoryPicker list={list} value={cat} income={income} onPick={setCat} onAddCat={onAddCat} />
+      {!income && <Text style={[s.mute, { marginTop: 10 }]}>Tip: mark ATM withdrawals “Leave out of totals” if you log cash spends here, so cash isn’t counted twice.</Text>}
+    </Sheet>
+  );
+}
+
+function CategoriesModal({ visible, cats, onAdd, onDelete, onClose }: {
+  visible: boolean; cats: CustomCategory[]; onAdd: (c: CustomCategory) => Promise<boolean>;
+  onDelete: (c: CustomCategory) => void; onClose: () => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const section = (title: string, list: CustomCategory[]) => (
+    <>
+      <Text style={[s.label, { marginTop: 14 }]}>{title}</Text>
+      {list.length === 0 && <Text style={s.mute}>None added yet.</Text>}
+      {list.map(c => (
+        <View key={c.name} style={s.manageRow}>
+          <Text style={{ fontSize: 18 }}>{c.icon}</Text>
+          <Text style={[s.body, { flex: 1 }]}>{c.name}</Text>
+          <Pressable hitSlop={10} onPress={() => onDelete(c)}><Text style={{ color: C.red, fontSize: 13 }}>Delete</Text></Pressable>
+        </View>
+      ))}
+    </>
+  );
+  return (
+    <Sheet visible={visible} onClose={onClose} footer={<Btn label="Done" onPress={onClose} primary />}>
+      <Text style={s.h2}>Your categories</Text>
+      <Text style={s.mute}>Built-in categories stay; these are the ones you added.</Text>
+      {section('EXPENSE', cats.filter(c => !c.income))}
+      {section('INCOME', cats.filter(c => c.income))}
+      {creating
+        ? <NewCategoryForm income={false} allowTypeSwitch onAdd={onAdd} onDone={() => setCreating(false)} />
+        : <View style={s.btnRow}><Btn label="＋ New category" onPress={() => setCreating(true)} /></View>}
+    </Sheet>
   );
 }
 
@@ -437,7 +575,11 @@ const s = StyleSheet.create({
   tabText: { color: C.mute, fontSize: 14, fontWeight: '600' },
   tabLine: { height: 2, width: 28, marginTop: 6, borderRadius: 1, backgroundColor: 'transparent' },
   backdrop: { flex: 1, backgroundColor: '#0009' },
-  sheet: { backgroundColor: C.card, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 20, maxHeight: '85%', borderTopWidth: 1, borderColor: C.line },
+  sheet: { backgroundColor: C.card, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 20, paddingTop: 20, maxHeight: '88%', borderTopWidth: 1, borderColor: C.line },
+  footer: { flexDirection: 'row', gap: 10, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.line, marginTop: 8 },
+  newForm: { backgroundColor: C.card2, borderRadius: 12, padding: 12, marginTop: 10, borderWidth: 1, borderColor: C.line },
+  iconCell: { width: 40, height: 40, borderRadius: 10, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'transparent' },
+  manageRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.line, gap: 10 },
   sheetAmt: { color: C.gold, fontSize: 32, fontFamily: serif, fontWeight: '600', marginBottom: 4 },
   catGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   switchRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 16 },
