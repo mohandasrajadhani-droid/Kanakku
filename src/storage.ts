@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { Txn } from './parser';
+export { mergeTxns, applyRule } from './merge';
 import type { CustomCategory } from './categories';
 
 const K = {
@@ -7,7 +8,15 @@ const K = {
   rules: 'kanakku.rules.v1',
   lastScan: 'kanakku.lastScan.v1',
   cats: 'kanakku.customCats.v1',
+  mail: 'kanakku.mail.v1',
 };
+
+export interface MailState { account: string | null; lastScan: number }
+export async function loadMail(): Promise<MailState> {
+  const v = await AsyncStorage.getItem(K.mail);
+  return v ? JSON.parse(v) : { account: null, lastScan: 0 };
+}
+export const saveMail = (m: MailState) => AsyncStorage.setItem(K.mail, JSON.stringify(m));
 
 export type Rules = Record<string, string>; // merchant (lowercase) -> category
 
@@ -25,27 +34,3 @@ export const saveCats = (c: CustomCategory[]) => AsyncStorage.setItem(K.cats, JS
 export const saveTxns = (t: Txn[]) => AsyncStorage.setItem(K.txns, JSON.stringify(t));
 export const saveRules = (r: Rules) => AsyncStorage.setItem(K.rules, JSON.stringify(r));
 export const saveLastScan = (n: number) => AsyncStorage.setItem(K.lastScan, String(n));
-
-/** Adds new transactions, skipping SMS already seen and the same payment reported twice (same ref + amount). */
-export function mergeTxns(existing: Txn[], incoming: Txn[]): { merged: Txn[]; added: number } {
-  const seenSms = new Set(existing.map(t => t.smsId).filter(Boolean));
-  const seenRef = new Set(existing.filter(t => t.ref).map(t => `${t.ref}|${t.amount}|${t.type}`));
-  const out = [...existing];
-  let added = 0;
-  for (const t of incoming) {
-    if (t.smsId && seenSms.has(t.smsId)) continue;
-    const refKey = t.ref ? `${t.ref}|${t.amount}|${t.type}` : null;
-    if (refKey && seenRef.has(refKey)) continue;
-    out.push(t);
-    if (t.smsId) seenSms.add(t.smsId);
-    if (refKey) seenRef.add(refKey);
-    added++;
-  }
-  out.sort((a, b) => b.date - a.date);
-  return { merged: out, added };
-}
-
-export function applyRule(t: Txn, rules: Rules): Txn {
-  const c = rules[t.merchant.toLowerCase()];
-  return c && t.type === 'debit' ? { ...t, category: c, excluded: c === 'Card Bill' ? true : t.excluded } : t;
-}

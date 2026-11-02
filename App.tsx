@@ -10,7 +10,10 @@ import {
   Category, catMeta, CUSTOM_COLORS, CUSTOM_ICONS, CustomCategory, expenseList, incomeList, isBuiltIn, registerCustom,
 } from './src/categories';
 import { ensureSmsPermission, readInbox } from './src/sms';
-import { applyRule, loadAll, mergeTxns, Rules, saveCats, saveLastScan, saveRules, saveTxns } from './src/storage';
+import {
+  applyRule, loadAll, loadMail, MailState, mergeTxns, Rules, saveCats, saveLastScan, saveMail, saveRules, saveTxns,
+} from './src/storage';
+import { connectGmail, disconnectGmail, fetchBankEmails } from './src/gmail';
 import { ago, C, fmtDate, fmtDay, inr, monthLabel } from './src/ui';
 
 const DAY = 86400000;
@@ -51,14 +54,16 @@ function Main() {
   const [adding, setAdding] = useState(false);
   const [managing, setManaging] = useState(false);
   const [cats, setCats] = useState<CustomCategory[]>([]);
+  const [mail, setMail] = useState<MailState>({ account: null, lastScan: 0 });
+  const [mailBusy, setMailBusy] = useState(false);
 
-  const runScan = useCallback(async (base: Txn[], baseRules: Rules, baseLast: number, silent: boolean) => {
+  const runScan = useCallback(async (base: Txn[], baseRules: Rules, baseLast: number, silent: boolean): Promise<Txn[]> => {
     setScanning(true);
     try {
       const ok = await ensureSmsPermission();
       if (!ok) {
         if (!silent) Alert.alert('SMS access needed', 'Allow SMS access so Kanakku can read bank and UPI alerts. Nothing leaves your phone.');
-        return;
+        return base;
       }
       const from = baseLast ? baseLast - 2 * DAY : Date.now() - FIRST_SCAN_DAYS * DAY;
       const sms = await readInbox(from);
@@ -69,31 +74,84 @@ function Main() {
       setLastScan(now);
       await Promise.all([saveTxns(merged), saveLastScan(now)]);
       if (!silent) Alert.alert('Scan complete', added ? `${added} new transaction${added > 1 ? 's' : ''} added.` : 'No new transactions.');
+      return merged;
     } catch (e: any) {
       if (!silent) Alert.alert('Scan failed', String(e?.message ?? e));
+      return base;
     } finally {
       setScanning(false);
     }
   }, []);
 
+  const runMail = useCallback(async (base: Txn[], baseRules: Rules, m: MailState, silent: boolean): Promise<Txn[]> => {
+    if (!m.account) return base;
+    setMailBusy(true);
+    try {
+      const since = m.lastScan ? m.lastScan - 2 * DAY : Date.now() - FIRST_SCAN_DAYS * DAY;
+      const seen = new Set(base.map(t => t.smsId).filter((x): x is string => !!x));
+      const found = (await fetchBankEmails(since, seen)).map(t => applyRule(t, baseRules));
+      const { merged, added } = mergeTxns(base, found);
+      const next = { ...m, lastScan: Date.now() };
+      setTxns(merged); setMail(next);
+      await Promise.all([saveTxns(merged), saveMail(next)]);
+      if (!silent) Alert.alert('Email check complete', added ? `${added} new transaction${added > 1 ? 's' : ''} from bank emails.` : 'No new transactions in email.');
+      return merged;
+    } catch (e: any) {
+      if (!silent) Alert.alert('Email check failed', String(e?.message ?? e));
+      return base;
+    } finally {
+      setMailBusy(false);
+    }
+  }, []);
+
+  const onConnectMail = async () => {
+    try {
+      const account = await connectGmail();
+      if (!account) return;
+      const m = { account, lastScan: 0 };
+      setMail(m); await saveMail(m);
+      await runMail(txns, rules, m, false);
+    } catch (e: any) {
+      Alert.alert('Could not connect Gmail', String(e?.message ?? e));
+    }
+  };
+
+  const onDisconnectMail = () => Alert.alert('Disconnect Gmail?', 'Entries already added from email stay in Kanakku.', [
+    { text: 'Cancel', style: 'cancel' },
+    {
+      text: 'Disconnect', style: 'destructive', onPress: async () => {
+        await disconnectGmail();
+        const m = { account: null, lastScan: 0 };
+        setMail(m); await saveMail(m);
+      },
+    },
+  ]);
+
   // Load saved data, then pick up new SMS automatically.
   useEffect(() => {
     (async () => {
-      const d = await loadAll();
+      const [d, m] = await Promise.all([loadAll(), loadMail()]);
       registerCustom(d.cats);
-      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats);
+      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m);
       setReady(true);
-      if (d.lastScan) runScan(d.txns, d.rules, d.lastScan, true);
+      let cur = d.txns;
+      if (d.lastScan) cur = await runScan(cur, d.rules, d.lastScan, true);
+      if (m.account) await runMail(cur, d.rules, m, true);
     })();
-  }, [runScan]);
+  }, [runScan, runMail]);
 
   // Re-scan when the app comes back to the foreground.
   useEffect(() => {
     const sub = AppState.addEventListener('change', s => {
-      if (s === 'active' && ready && lastScan && !scanning) runScan(txns, rules, lastScan, true);
+      if (s !== 'active' || !ready || scanning || mailBusy) return;
+      (async () => {
+        let cur = txns;
+        if (lastScan) cur = await runScan(cur, rules, lastScan, true);
+        if (mail.account) await runMail(cur, rules, mail, true);
+      })();
     });
     return () => sub.remove();
-  }, [ready, lastScan, scanning, txns, rules, runScan]);
+  }, [ready, lastScan, scanning, mailBusy, mail, txns, rules, runScan, runMail]);
 
   const persist = async (next: Txn[]) => { setTxns(next); await saveTxns(next); };
 
@@ -197,7 +255,7 @@ function Main() {
     <View style={[s.fill, { paddingTop: insets.top }]}>
       <View style={s.header}>
         <Text style={s.brand}>Kanakku</Text>
-        <Text style={s.sub}>{scanning ? 'Reading messages…' : `Updated ${ago(lastScan)}`}</Text>
+        <Text style={s.sub}>{scanning ? 'Reading messages…' : mailBusy ? 'Reading email…' : `Updated ${ago(Math.max(lastScan, mail.lastScan))}`}</Text>
       </View>
 
       <View style={s.monthRow}>
@@ -266,6 +324,26 @@ function Main() {
               <Btn label="Export month (CSV)" onPress={exportCsv} />
             </View>
           )}
+
+          <View style={[s.card, { marginTop: 14 }]}>
+            <Text style={s.h2}>Bank emails</Text>
+            {mail.account ? (
+              <>
+                <Text style={s.body}>Gmail: {mail.account}</Text>
+                <Text style={s.mute}>Checked {ago(mail.lastScan)} · payments seen in both SMS and email are counted once</Text>
+                <View style={s.btnRow}>
+                  <Btn label={mailBusy ? 'Reading…' : 'Check email now'} onPress={() => runMail(txns, rules, mail, false)} disabled={mailBusy} />
+                  <Btn label="Disconnect" onPress={onDisconnectMail} danger />
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={s.body}>Also read bank alert emails (card spends, NEFT, UPI) from Gmail. Read-only access; emails stay in Gmail.</Text>
+                <View style={s.btnRow}><Btn label={mailBusy ? 'Connecting…' : 'Connect Gmail'} onPress={onConnectMail} disabled={mailBusy} primary /></View>
+              </>
+            )}
+          </View>
+
           <View style={s.btnRow}>
             <Btn label="Manage categories" onPress={() => setManaging(true)} />
           </View>
@@ -312,7 +390,7 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
       <View style={{ flex: 1 }}>
         <Text style={s.txnName} numberOfLines={1}>{t.merchant}</Text>
         <Text style={s.txnMeta} numberOfLines={1}>
-          {t.category} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}
+          {t.source === 'email' ? '✉ ' : ''}{t.category} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}
         </Text>
       </View>
       <View style={{ alignItems: 'flex-end' }}>
@@ -433,7 +511,7 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
 
       {t.body && (
         <>
-          <Text style={[s.label, { marginTop: 14 }]}>ORIGINAL MESSAGE</Text>
+          <Text style={[s.label, { marginTop: 14 }]}>{t.source === 'email' ? 'FROM BANK EMAIL' : 'ORIGINAL MESSAGE'}</Text>
           <Text style={s.smsBox}>{t.body}</Text>
         </>
       )}
