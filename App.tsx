@@ -407,17 +407,29 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
 function Sheet({ visible, onClose, children, footer }: {
   visible: boolean; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode;
 }) {
-  const insets = useSafeAreaInsets();
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <Pressable style={s.backdrop} onPress={onClose} />
-        <View style={[s.sheet, { paddingBottom: insets.bottom + 14 }]}>
-          <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
-          {footer && <View style={s.footer}>{footer}</View>}
-        </View>
-      </KeyboardAvoidingView>
+      {/* A modal is its own window, so it needs its own safe-area measurement. */}
+      <SafeAreaProvider>
+        <SheetBody onClose={onClose} footer={footer}>{children}</SheetBody>
+      </SafeAreaProvider>
     </Modal>
+  );
+}
+
+// Space kept clear for the phone's navigation bar (3-button bar is ~48dp), even if the system reports less.
+const NAV_BAR_MIN = 48;
+
+function SheetBody({ onClose, children, footer }: { onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
+  const insets = useSafeAreaInsets();
+  return (
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+      <Pressable style={s.backdrop} onPress={onClose} />
+      <View style={[s.sheet, { paddingBottom: Math.max(insets.bottom, NAV_BAR_MIN) + 12 }]}>
+        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
+        {footer && <View style={s.footer}>{footer}</View>}
+      </View>
+    </KeyboardAvoidingView>
   );
 }
 
