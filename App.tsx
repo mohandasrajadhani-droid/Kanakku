@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, FlatList, Keyboard, Modal, Pressable, ScrollView, Share,
+  ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Pressable, ScrollView, Share,
   StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -53,6 +53,7 @@ function Main() {
   const [selected, setSelected] = useState<Txn | null>(null);
   const [adding, setAdding] = useState(false);
   const [managing, setManaging] = useState(false);
+  const [newCat, setNewCat] = useState<{ income: boolean; switchable: boolean; onCreated?: (name: string) => void } | null>(null);
   const [cats, setCats] = useState<CustomCategory[]>([]);
   const [mail, setMail] = useState<MailState>({ account: null, lastScan: 0 });
   const [mailBusy, setMailBusy] = useState(false);
@@ -180,6 +181,8 @@ function Main() {
     await persist([t, ...txns]);
     setAdding(false);
   };
+
+  const openNewCat: NewCatFn = (income, onCreated) => setNewCat({ income, switchable: false, onCreated });
 
   const addCategory = async (c: CustomCategory): Promise<boolean> => {
     const name = c.name.trim();
@@ -375,9 +378,11 @@ function Main() {
         <TabBtn label="Transactions" on={tab === 'txns'} onPress={() => setTab('txns')} />
       </View>
 
-      <TxnModal t={selected} cats={cats} onAddCat={addCategory} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
-      <EntryModal visible={adding} cats={cats} onAddCat={addCategory} onClose={() => setAdding(false)} onSave={addEntry} />
-      <CategoriesModal visible={managing} cats={cats} onAdd={addCategory} onDelete={deleteCategory} onClose={() => setManaging(false)} />
+      <TxnModal t={selected} cats={cats} onNewCat={openNewCat} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
+      <EntryModal visible={adding} cats={cats} onNewCat={openNewCat} onClose={() => setAdding(false)} onSave={addEntry} />
+      <CategoriesModal visible={managing} cats={cats} onNew={() => setNewCat({ income: false, switchable: true })} onDelete={deleteCategory} onClose={() => setManaging(false)} />
+      <NewCategorySheet visible={!!newCat} income={newCat?.income ?? false} allowTypeSwitch={newCat?.switchable} onAdd={addCategory}
+        onDone={name => { const cb = newCat?.onCreated; setNewCat(null); if (name && cb) cb(name); }} />
     </View>
   );
 }
@@ -404,17 +409,35 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
   );
 }
 
-/** Bottom sheet that stays above the keyboard and the phone's navigation bar; buttons sit in a fixed footer. */
+/**
+ * Bottom sheet drawn inside the main screen (not a separate Android window), so typing never freezes it.
+ * Buttons sit in a fixed footer above the navigation bar and the keyboard; the Back key closes it.
+ */
 function Sheet({ visible, onClose, children, footer }: {
   visible: boolean; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode;
 }) {
+  const insets = useSafeAreaInsets();
+  const kbTop = useKeyboardTop();
+  const [rootH, setRootH] = useState(0);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    if (!visible) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => { closeRef.current(); return true; });
+    return () => sub.remove();
+  }, [visible]);
+  if (!visible) return null;
+  // Lift the sheet by however much the keyboard covers it.
+  const covered = kbTop != null && rootH > 0 ? Math.max(0, rootH - kbTop) : 0;
+  const bottom = covered > 0 ? covered + 8 : Math.max(insets.bottom, NAV_BAR_MIN) + 12;
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
-      {/* A modal is its own window, so it needs its own safe-area measurement. */}
-      <SafeAreaProvider>
-        <SheetBody onClose={onClose} footer={footer}>{children}</SheetBody>
-      </SafeAreaProvider>
-    </Modal>
+    <View style={[StyleSheet.absoluteFill, { zIndex: 10, elevation: 10 }]} onLayout={e => setRootH(e.nativeEvent.layout.height)}>
+      <Pressable style={s.backdrop} onPress={() => { Keyboard.dismiss(); onClose(); }} />
+      <View style={[s.sheet, { paddingBottom: bottom, maxHeight: '92%' }]}>
+        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
+        {footer && <View style={s.footer}>{footer}</View>}
+      </View>
+    </View>
   );
 }
 
@@ -430,24 +453,6 @@ function useKeyboardTop() {
     return () => { show.remove(); hide.remove(); };
   }, []);
   return top;
-}
-
-function SheetBody({ onClose, children, footer }: { onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
-  const insets = useSafeAreaInsets();
-  const kbTop = useKeyboardTop();
-  const [rootH, setRootH] = useState(0);
-  // Lift the sheet (and its footer buttons) by however much the keyboard actually covers it.
-  const covered = kbTop != null && rootH > 0 ? Math.max(0, rootH - kbTop) : 0;
-  const bottom = covered > 0 ? covered + 8 : Math.max(insets.bottom, NAV_BAR_MIN) + 12;
-  return (
-    <View style={{ flex: 1 }} onLayout={e => setRootH(e.nativeEvent.layout.height)}>
-      <Pressable style={s.backdrop} onPress={onClose} />
-      <View style={[s.sheet, { paddingBottom: bottom, maxHeight: '92%' }]}>
-        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
-        {footer && <View style={s.footer}>{footer}</View>}
-      </View>
-    </View>
-  );
 }
 
 /** Separate sheet for creating a category; its Add button sits in the fixed footer so it is never hidden. */
@@ -492,24 +497,21 @@ function NewCategorySheet({ visible, income, allowTypeSwitch, onAdd, onDone }: {
 }
 
 /** Category chips plus a "＋ New" chip that opens the new-category sheet. */
-function CategoryPicker({ list, value, income, onPick, onAddCat }: {
-  list: Category[]; value: string; income: boolean; onPick: (name: string) => void; onAddCat: (c: CustomCategory) => Promise<boolean>;
+function CategoryPicker({ list, value, onPick, onNew }: {
+  list: Category[]; value: string; onPick: (name: string) => void; onNew: () => void;
 }) {
-  const [creating, setCreating] = useState(false);
   return (
-    <>
-      <View style={s.catGrid}>
-        {list.map(c => <Chip key={c.name} label={`${c.icon} ${c.name}`} on={value === c.name} onPress={() => onPick(c.name)} />)}
-        <Chip label="＋ New" onPress={() => setCreating(true)} />
-      </View>
-      <NewCategorySheet visible={creating} income={income} onAdd={onAddCat}
-        onDone={n => { setCreating(false); if (n) onPick(n); }} />
-    </>
+    <View style={s.catGrid}>
+      {list.map(c => <Chip key={c.name} label={`${c.icon} ${c.name}`} on={value === c.name} onPress={() => onPick(c.name)} />)}
+      <Chip label="＋ New" onPress={() => { Keyboard.dismiss(); onNew(); }} />
+    </View>
   );
 }
 
-function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
-  t: Txn | null; cats: CustomCategory[]; onAddCat: (c: CustomCategory) => Promise<boolean>; onClose: () => void;
+type NewCatFn = (income: boolean, onCreated: (name: string) => void) => void;
+
+function TxnModal({ t, cats, onNewCat, onClose, onUpdate, onDelete }: {
+  t: Txn | null; cats: CustomCategory[]; onNewCat: NewCatFn; onClose: () => void;
   onUpdate: (id: string, p: Partial<Txn>, remember: boolean) => void; onDelete: (id: string) => void;
 }) {
   const [remember, setRemember] = useState(true);
@@ -539,7 +541,8 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
         value={note} onChangeText={setNote} onEndEditing={saveNote} multiline maxLength={200} />
 
       <Text style={[s.label, { marginTop: 8 }]}>CATEGORY</Text>
-      <CategoryPicker list={list} value={t.category} income={income} onAddCat={onAddCat}
+      <CategoryPicker list={list} value={t.category}
+        onNew={() => onNewCat(income, name => onUpdate(t.id, { category: name }, remember))}
         onPick={name => onUpdate(t.id, { category: name, ...(name === 'Card Bill' ? { excluded: true } : {}) }, remember)} />
       {!t.manual && (
         <View style={s.switchRow}>
@@ -562,8 +565,8 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
   );
 }
 
-function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
-  visible: boolean; cats: CustomCategory[]; onAddCat: (c: CustomCategory) => Promise<boolean>; onClose: () => void;
+function EntryModal({ visible, cats, onNewCat, onClose, onSave }: {
+  visible: boolean; cats: CustomCategory[]; onNewCat: NewCatFn; onClose: () => void;
   onSave: (type: 'debit' | 'credit', a: number, n: string, c: string, narration: string) => void;
 }) {
   const [type, setType] = useState<'debit' | 'credit'>('debit');
@@ -595,17 +598,16 @@ function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
       <TextInput style={s.input} placeholder={income ? 'Received from (e.g. Tenant)' : 'Paid to / for (e.g. Vegetable shop)'} placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
       <TextInput style={[s.input, s.noteInput]} placeholder="Narration (optional details)" placeholderTextColor={C.mute} value={narration} onChangeText={setNarration} multiline maxLength={200} />
       <Text style={s.label}>CATEGORY</Text>
-      <CategoryPicker list={list} value={cat} income={income} onPick={setCat} onAddCat={onAddCat} />
+      <CategoryPicker list={list} value={cat} onPick={setCat} onNew={() => onNewCat(income, setCat)} />
       {!income && <Text style={[s.mute, { marginTop: 10 }]}>Tip: mark ATM withdrawals “Leave out of totals” if you log cash spends here, so cash isn’t counted twice.</Text>}
     </Sheet>
   );
 }
 
-function CategoriesModal({ visible, cats, onAdd, onDelete, onClose }: {
-  visible: boolean; cats: CustomCategory[]; onAdd: (c: CustomCategory) => Promise<boolean>;
+function CategoriesModal({ visible, cats, onNew, onDelete, onClose }: {
+  visible: boolean; cats: CustomCategory[]; onNew: () => void;
   onDelete: (c: CustomCategory) => void; onClose: () => void;
 }) {
-  const [creating, setCreating] = useState(false);
   const section = (title: string, list: CustomCategory[]) => (
     <>
       <Text style={[s.label, { marginTop: 14 }]}>{title}</Text>
@@ -621,14 +623,13 @@ function CategoriesModal({ visible, cats, onAdd, onDelete, onClose }: {
   );
   return (
     <Sheet visible={visible} onClose={onClose} footer={<>
-      <Btn label="＋ New category" onPress={() => setCreating(true)} />
+      <Btn label="＋ New category" onPress={onNew} />
       <Btn label="Done" onPress={onClose} primary />
     </>}>
       <Text style={s.h2}>Your categories</Text>
       <Text style={s.mute}>Built-in categories stay; these are the ones you added.</Text>
       {section('EXPENSE', cats.filter(c => !c.income))}
       {section('INCOME', cats.filter(c => c.income))}
-      <NewCategorySheet visible={creating} income={false} allowTypeSwitch onAdd={onAdd} onDone={() => setCreating(false)} />
     </Sheet>
   );
 }
