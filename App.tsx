@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Share,
+  ActivityIndicator, Alert, AppState, FlatList, Keyboard, Modal, Pressable, ScrollView, Share,
   StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -171,11 +171,11 @@ function Main() {
 
   const deleteTxn = async (id: string) => { await persist(txns.filter(t => t.id !== id)); setSelected(null); };
 
-  const addEntry = async (type: 'debit' | 'credit', amount: number, note: string, category: string) => {
+  const addEntry = async (type: 'debit' | 'credit', amount: number, note: string, category: string, narration: string) => {
     const t: Txn = {
       id: `cash-${Date.now()}`, date: Date.now(), amount, type,
       merchant: note || (type === 'debit' ? 'Cash expense' : 'Cash received'),
-      mode: 'Cash', category, manual: true,
+      mode: 'Cash', category, manual: true, note: narration || undefined,
     };
     await persist([t, ...txns]);
     setAdding(false);
@@ -241,9 +241,9 @@ function Main() {
 
   const exportCsv = async () => {
     const q = (s: unknown) => `"${String(s ?? '').replace(/"/g, '""')}"`;
-    const rows = [['Date', 'Type', 'Amount', 'Payee', 'Category', 'Mode', 'Bank', 'Account', 'Reference', 'Counted']];
+    const rows = [['Date', 'Type', 'Amount', 'Payee', 'Narration', 'Category', 'Mode', 'Bank', 'Account', 'Reference', 'Counted']];
     for (const t of [...monthTx].reverse()) {
-      rows.push([fmtDay(t.date), t.type === 'debit' ? 'Paid' : 'Received', t.amount.toFixed(2), t.merchant, t.category, t.mode,
+      rows.push([fmtDay(t.date), t.type === 'debit' ? 'Paid' : 'Received', t.amount.toFixed(2), t.merchant, t.note ?? '', t.category, t.mode,
         t.bank ?? '', t.account ? `xx${t.account}` : '', t.ref ?? '', t.excluded ? 'No' : 'Yes']);
     }
     await Share.share({ title: `Kanakku ${monthLabel(month)}`, message: rows.map(r => r.map(q).join(',')).join('\n') });
@@ -392,6 +392,7 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
         <Text style={s.txnMeta} numberOfLines={1}>
           {t.source === 'email' ? '✉ ' : ''}{t.category} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}
         </Text>
+        {!!t.note && <Text style={s.txnNote} numberOfLines={2}>✎ {t.note}</Text>}
       </View>
       <View style={{ alignItems: 'flex-end' }}>
         <Text style={[s.txnAmt, { color: t.type === 'credit' ? C.green : C.text }]}>
@@ -420,57 +421,77 @@ function Sheet({ visible, onClose, children, footer }: {
 // Space kept clear for the phone's navigation bar (3-button bar is ~48dp), even if the system reports less.
 const NAV_BAR_MIN = 48;
 
+/** Screen Y of the keyboard's top edge, or null when the keyboard is closed. */
+function useKeyboardTop() {
+  const [top, setTop] = useState<number | null>(null);
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', e => setTop(e.endCoordinates.screenY));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setTop(null));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+  return top;
+}
+
 function SheetBody({ onClose, children, footer }: { onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
   const insets = useSafeAreaInsets();
+  const kbTop = useKeyboardTop();
+  const [rootH, setRootH] = useState(0);
+  // Lift the sheet (and its footer buttons) by however much the keyboard actually covers it.
+  const covered = kbTop != null && rootH > 0 ? Math.max(0, rootH - kbTop) : 0;
+  const bottom = covered > 0 ? covered + 8 : Math.max(insets.bottom, NAV_BAR_MIN) + 12;
   return (
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+    <View style={{ flex: 1 }} onLayout={e => setRootH(e.nativeEvent.layout.height)}>
       <Pressable style={s.backdrop} onPress={onClose} />
-      <View style={[s.sheet, { paddingBottom: Math.max(insets.bottom, NAV_BAR_MIN) + 12 }]}>
+      <View style={[s.sheet, { paddingBottom: bottom, maxHeight: '92%' }]}>
         <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
         {footer && <View style={s.footer}>{footer}</View>}
       </View>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
-/** Inline form to create a category; used inside pickers and the manage screen. */
-function NewCategoryForm({ income, onAdd, onDone, allowTypeSwitch }: {
-  income: boolean; onAdd: (c: CustomCategory) => Promise<boolean>; onDone: (name?: string) => void; allowTypeSwitch?: boolean;
+/** Separate sheet for creating a category; its Add button sits in the fixed footer so it is never hidden. */
+function NewCategorySheet({ visible, income, allowTypeSwitch, onAdd, onDone }: {
+  visible: boolean; income: boolean; allowTypeSwitch?: boolean;
+  onAdd: (c: CustomCategory) => Promise<boolean>; onDone: (name?: string) => void;
 }) {
   const [name, setName] = useState('');
   const [icon, setIcon] = useState(CUSTOM_ICONS[0]);
   const [isIncome, setIsIncome] = useState(income);
+  useEffect(() => { if (visible) { setIsIncome(income); setName(''); setIcon(CUSTOM_ICONS[0]); } }, [visible, income]);
   const save = async () => {
     const color = CUSTOM_COLORS[Math.floor(Math.random() * CUSTOM_COLORS.length)];
     const ok = await onAdd({ name, icon, color, income: isIncome, custom: true });
-    if (ok) { onDone(name.trim()); setName(''); }
+    if (ok) { Keyboard.dismiss(); onDone(name.trim()); }
   };
   return (
-    <View style={s.newForm}>
+    <Sheet visible={visible} onClose={() => onDone()} footer={<>
+      <Btn label="Cancel" onPress={() => onDone()} />
+      <Btn label="Add category" onPress={save} primary />
+    </>}>
+      <Text style={s.h2}>New {isIncome ? 'income' : 'expense'} category</Text>
       {allowTypeSwitch && (
         <View style={[s.catGrid, { marginBottom: 10 }]}>
           <Chip label="Expense" on={!isIncome} onPress={() => setIsIncome(false)} />
           <Chip label="Income" on={isIncome} onPress={() => setIsIncome(true)} />
         </View>
       )}
-      <TextInput style={s.input} placeholder={isIncome ? 'Income category (e.g. Rent received)' : 'Expense category (e.g. House rent)'}
-        placeholderTextColor={C.mute} value={name} onChangeText={setName} maxLength={24} />
+      <TextInput style={s.input} placeholder={isIncome ? 'Name (e.g. Rent received)' : 'Name (e.g. House rent)'}
+        placeholderTextColor={C.mute} value={name} onChangeText={setName} maxLength={24} autoFocus
+        returnKeyType="done" onSubmitEditing={save} />
+      <Text style={s.label}>ICON</Text>
       <View style={[s.catGrid, { gap: 4 }]}>
         {CUSTOM_ICONS.map(i => (
-          <Pressable key={i} onPress={() => setIcon(i)} style={[s.iconCell, icon === i && { borderColor: C.gold, backgroundColor: C.card }]}>
+          <Pressable key={i} onPress={() => setIcon(i)} style={[s.iconCell, icon === i && { borderColor: C.gold, backgroundColor: C.card2 }]}>
             <Text style={{ fontSize: 20 }}>{i}</Text>
           </Pressable>
         ))}
       </View>
-      <View style={s.btnRow}>
-        <Btn label="Cancel" onPress={() => onDone()} />
-        <Btn label="Add category" onPress={save} primary />
-      </View>
-    </View>
+    </Sheet>
   );
 }
 
-/** Category chips plus a "＋ New" chip that opens the inline form. */
+/** Category chips plus a "＋ New" chip that opens the new-category sheet. */
 function CategoryPicker({ list, value, income, onPick, onAddCat }: {
   list: Category[]; value: string; income: boolean; onPick: (name: string) => void; onAddCat: (c: CustomCategory) => Promise<boolean>;
 }) {
@@ -479,11 +500,10 @@ function CategoryPicker({ list, value, income, onPick, onAddCat }: {
     <>
       <View style={s.catGrid}>
         {list.map(c => <Chip key={c.name} label={`${c.icon} ${c.name}`} on={value === c.name} onPress={() => onPick(c.name)} />)}
-        {!creating && <Chip label="＋ New" onPress={() => setCreating(true)} />}
+        <Chip label="＋ New" onPress={() => setCreating(true)} />
       </View>
-      {creating && (
-        <NewCategoryForm income={income} onAdd={onAddCat} onDone={n => { setCreating(false); if (n) onPick(n); }} />
-      )}
+      <NewCategorySheet visible={creating} income={income} onAdd={onAddCat}
+        onDone={n => { setCreating(false); if (n) onPick(n); }} />
     </>
   );
 }
@@ -493,13 +513,20 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
   onUpdate: (id: string, p: Partial<Txn>, remember: boolean) => void; onDelete: (id: string) => void;
 }) {
   const [remember, setRemember] = useState(true);
+  const [note, setNote] = useState('');
+  useEffect(() => { setNote(t?.note ?? ''); }, [t?.id]);
   if (!t) return null;
   const income = t.type === 'credit';
   const list = income ? incomeList(cats) : expenseList(cats);
+  const saveNote = () => {
+    const v = note.trim();
+    if (v !== (t.note ?? '')) onUpdate(t.id, { note: v || undefined }, false);
+  };
+  const close = () => { saveNote(); onClose(); };
   return (
-    <Sheet visible onClose={onClose} footer={<>
+    <Sheet visible onClose={close} footer={<>
       {t.manual && <Btn label="Delete" onPress={() => onDelete(t.id)} danger />}
-      <Btn label="Done" onPress={onClose} primary />
+      <Btn label="Done" onPress={close} primary />
     </>}>
       <Text style={s.sheetAmt}>{income ? '+' : '−'}{inr(t.amount, true)}</Text>
       <Text style={s.h2}>{t.merchant}</Text>
@@ -507,7 +534,11 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
         {fmtDate(t.date)} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}{t.ref ? `\nRef ${t.ref}` : ''}
       </Text>
 
-      <Text style={[s.label, { marginTop: 18 }]}>CATEGORY</Text>
+      <Text style={[s.label, { marginTop: 18 }]}>NARRATION</Text>
+      <TextInput style={[s.input, s.noteInput]} placeholder="Add a note (e.g. Mother's medicine, shop rent Nov)" placeholderTextColor={C.mute}
+        value={note} onChangeText={setNote} onEndEditing={saveNote} multiline maxLength={200} />
+
+      <Text style={[s.label, { marginTop: 8 }]}>CATEGORY</Text>
       <CategoryPicker list={list} value={t.category} income={income} onAddCat={onAddCat}
         onPick={name => onUpdate(t.id, { category: name, ...(name === 'Card Bill' ? { excluded: true } : {}) }, remember)} />
       {!t.manual && (
@@ -533,11 +564,12 @@ function TxnModal({ t, cats, onAddCat, onClose, onUpdate, onDelete }: {
 
 function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
   visible: boolean; cats: CustomCategory[]; onAddCat: (c: CustomCategory) => Promise<boolean>; onClose: () => void;
-  onSave: (type: 'debit' | 'credit', a: number, n: string, c: string) => void;
+  onSave: (type: 'debit' | 'credit', a: number, n: string, c: string, narration: string) => void;
 }) {
   const [type, setType] = useState<'debit' | 'credit'>('debit');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
+  const [narration, setNarration] = useState('');
   const [cat, setCat] = useState('Food & Dining');
   const income = type === 'credit';
   const list = (income ? incomeList(cats) : expenseList(cats)).filter(c => !['Card Bill', 'Cash Withdrawal'].includes(c.name));
@@ -545,8 +577,9 @@ function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
   const save = () => {
     const a = parseFloat(amount.replace(/,/g, ''));
     if (!(a > 0)) { Alert.alert('Enter an amount'); return; }
-    onSave(type, a, note.trim(), cat);
-    setAmount(''); setNote('');
+    Keyboard.dismiss();
+    onSave(type, a, note.trim(), cat, narration.trim());
+    setAmount(''); setNote(''); setNarration('');
   };
   return (
     <Sheet visible={visible} onClose={onClose} footer={<>
@@ -559,7 +592,8 @@ function EntryModal({ visible, cats, onAddCat, onClose, onSave }: {
         <Chip label="Received" on={income} onPress={() => switchType('credit')} />
       </View>
       <TextInput style={s.input} placeholder="Amount (₹)" placeholderTextColor={C.mute} keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
-      <TextInput style={s.input} placeholder={income ? 'From / what for? (e.g. Rent)' : 'What for? (e.g. Vegetables)'} placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
+      <TextInput style={s.input} placeholder={income ? 'Received from (e.g. Tenant)' : 'Paid to / for (e.g. Vegetable shop)'} placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
+      <TextInput style={[s.input, s.noteInput]} placeholder="Narration (optional details)" placeholderTextColor={C.mute} value={narration} onChangeText={setNarration} multiline maxLength={200} />
       <Text style={s.label}>CATEGORY</Text>
       <CategoryPicker list={list} value={cat} income={income} onPick={setCat} onAddCat={onAddCat} />
       {!income && <Text style={[s.mute, { marginTop: 10 }]}>Tip: mark ATM withdrawals “Leave out of totals” if you log cash spends here, so cash isn’t counted twice.</Text>}
@@ -586,14 +620,15 @@ function CategoriesModal({ visible, cats, onAdd, onDelete, onClose }: {
     </>
   );
   return (
-    <Sheet visible={visible} onClose={onClose} footer={<Btn label="Done" onPress={onClose} primary />}>
+    <Sheet visible={visible} onClose={onClose} footer={<>
+      <Btn label="＋ New category" onPress={() => setCreating(true)} />
+      <Btn label="Done" onPress={onClose} primary />
+    </>}>
       <Text style={s.h2}>Your categories</Text>
       <Text style={s.mute}>Built-in categories stay; these are the ones you added.</Text>
       {section('EXPENSE', cats.filter(c => !c.income))}
       {section('INCOME', cats.filter(c => c.income))}
-      {creating
-        ? <NewCategoryForm income={false} allowTypeSwitch onAdd={onAdd} onDone={() => setCreating(false)} />
-        : <View style={s.btnRow}><Btn label="＋ New category" onPress={() => setCreating(true)} /></View>}
+      <NewCategorySheet visible={creating} income={false} allowTypeSwitch onAdd={onAdd} onDone={() => setCreating(false)} />
     </Sheet>
   );
 }
@@ -667,6 +702,8 @@ const s = StyleSheet.create({
   backdrop: { flex: 1, backgroundColor: '#0009' },
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 20, paddingTop: 20, maxHeight: '88%', borderTopWidth: 1, borderColor: C.line },
   footer: { flexDirection: 'row', gap: 10, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.line, marginTop: 8 },
+  txnNote: { color: C.gold, fontSize: 12, marginTop: 3, fontStyle: 'italic' },
+  noteInput: { minHeight: 48, textAlignVertical: 'top' },
   newForm: { backgroundColor: C.card2, borderRadius: 12, padding: 12, marginTop: 10, borderWidth: 1, borderColor: C.line },
   iconCell: { width: 40, height: 40, borderRadius: 10, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'transparent' },
   manageRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.line, gap: 10 },

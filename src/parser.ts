@@ -19,6 +19,7 @@ export interface Txn {
   manual?: boolean;
   body?: string;
   source?: 'sms' | 'email';
+  note?: string; // narration typed by the user
 }
 
 export interface RawSms {
