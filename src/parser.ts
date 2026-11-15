@@ -20,6 +20,10 @@ export interface Txn {
   body?: string;
   source?: 'sms' | 'email';
   note?: string; // narration typed by the user
+  accountId?: string;  // your account chosen by hand ('none' = not linked)
+  userEdited?: boolean; // category / totals changed by hand
+  selfTransfer?: boolean; // marked automatically as a move between your own accounts
+  preTransfer?: { excluded?: boolean; category: string };
 }
 
 export interface RawSms {

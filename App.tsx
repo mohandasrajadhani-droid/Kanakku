@@ -11,8 +11,8 @@ import {
 } from './src/categories';
 import { ensureSmsPermission, readInbox } from './src/sms';
 import {
-  applyRule, BackupState, loadAll, loadBackupState, loadMail, MailState, mergeTxns, replaceAll, Rules, saveBackupState,
-  saveCats, saveLastScan, saveMail, saveRules, saveTxns, snapshot,
+  applyRule, BackupState, loadAccounts, loadAll, loadBackupState, loadMail, MailState, mergeTxns, replaceAll, Rules, saveBackupState,
+  saveAccounts, saveCats, saveLastScan, saveMail, saveRules, saveTxns, snapshot,
 } from './src/storage';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
@@ -22,10 +22,13 @@ import { DriveBackup, downloadBackup, listBackups, uploadBackup } from './src/dr
 import { ensureScope, SCOPES } from './src/google';
 import { connectGmail, disconnectGmail, fetchBankEmails } from './src/gmail';
 import { ago, C, fmtDate, fmtDay, inr, monthLabel } from './src/ui';
+import { Btn, Chip, s, Sheet, Stat, TabBtn } from './src/kit';
+import { Account, accountFor, balanceOf, markSelfTransfers, reported } from './src/accounts';
+import { AccountPicker, AccountSheet, AccountsTab } from './src/AccountsView';
 
 const DAY = 86400000;
 const FIRST_SCAN_DAYS = 120;
-type Tab = 'overview' | 'txns';
+type Tab = 'overview' | 'txns' | 'accounts';
 type Filter = 'all' | 'debit' | 'credit';
 
 export default function App() {
@@ -67,6 +70,12 @@ function Main() {
   const [cats, setCats] = useState<CustomCategory[]>([]);
   const [mail, setMail] = useState<MailState>({ account: null, lastScan: 0 });
   const [mailBusy, setMailBusy] = useState(false);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const accountsRef = useRef<Account[]>([]);
+  const [accSheet, setAccSheet] = useState<{ account: Account | null; draft?: Partial<Account> } | null>(null);
+  const [accFilter, setAccFilter] = useState<string | null>(null);
+  /** Re-checks which entries are moves between your own accounts (left out of totals). */
+  const withTransfers = (list: Txn[]) => markSelfTransfers(list, accountsRef.current);
 
   const runScan = useCallback(async (base: Txn[], baseRules: Rules, baseLast: number, silent: boolean): Promise<Txn[]> => {
     setScanning(true);
@@ -79,7 +88,8 @@ function Main() {
       const from = baseLast ? baseLast - 2 * DAY : Date.now() - FIRST_SCAN_DAYS * DAY;
       const sms = await readInbox(from);
       const parsed = sms.map(parseSms).filter((t): t is Txn => !!t).map(t => applyRule(t, baseRules));
-      const { merged, added } = mergeTxns(base, parsed);
+      const { merged: m0, added } = mergeTxns(base, parsed);
+      const merged = withTransfers(m0);
       const now = Date.now();
       setTxns(merged);
       setLastScan(now);
@@ -101,7 +111,8 @@ function Main() {
       const since = m.lastScan ? m.lastScan - 2 * DAY : Date.now() - FIRST_SCAN_DAYS * DAY;
       const seen = new Set(base.map(t => t.smsId).filter((x): x is string => !!x));
       const found = (await fetchBankEmails(since, seen)).map(t => applyRule(t, baseRules));
-      const { merged, added } = mergeTxns(base, found);
+      const { merged: m0, added } = mergeTxns(base, found);
+      const merged = withTransfers(m0);
       const next = { ...m, lastScan: Date.now() };
       setTxns(merged); setMail(next);
       await Promise.all([saveTxns(merged), saveMail(next)]);
@@ -193,8 +204,9 @@ function Main() {
       {
         text: 'Restore', style: 'destructive', onPress: async () => {
           await replaceAll(data);
-          const [d, m] = await Promise.all([loadAll(), loadMail()]);
+          const [d, m, accs] = await Promise.all([loadAll(), loadMail(), loadAccounts()]);
           registerCustom(d.cats);
+          accountsRef.current = accs; setAccounts(accs);
           setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m);
           setRestoreList(null);
           Alert.alert('Restored', `${d.txns.length} entries are back.`);
@@ -233,14 +245,15 @@ function Main() {
   // Load saved data, then pick up new SMS automatically.
   useEffect(() => {
     (async () => {
-      let d, m, b: BackupState;
+      let d, m, b: BackupState, accs: Account[];
       try {
-        [d, m, b] = await Promise.all([loadAll(), loadMail(), loadBackupState()]);
+        [d, m, b, accs] = await Promise.all([loadAll(), loadMail(), loadBackupState(), loadAccounts()]);
       } catch (e: any) {
         Alert.alert('Could not open saved data', String(e?.message ?? e));
         return;
       }
       registerCustom(d.cats);
+      accountsRef.current = accs; setAccounts(accs);
       setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m); setBackup(b);
       setReady(true);
       let cur = d.txns;
@@ -269,6 +282,7 @@ function Main() {
   const updateTxn = async (id: string, patch: Partial<Txn>, remember: boolean) => {
     const orig = txns.find(t => t.id === id);
     if (!orig) return;
+    if ('category' in patch || 'excluded' in patch) patch = { ...patch, userEdited: true, selfTransfer: undefined, preTransfer: undefined };
     let next = txns.map(t => (t.id === id ? { ...t, ...patch } : t));
     if (remember && patch.category && !orig.manual) {
       const key = orig.merchant.toLowerCase();
@@ -276,17 +290,39 @@ function Main() {
       setRules(r); await saveRules(r);
       next = next.map(t => (!t.manual && t.type === orig.type && t.merchant.toLowerCase() === key ? { ...t, category: patch.category! } : t));
     }
+    if ('accountId' in patch) next = withTransfers(next);
     await persist(next);
     setSelected(next.find(t => t.id === id) || null);
   };
 
+  // ---------- Accounts ----------
+  const applyAccounts = async (next: Account[], txnList: Txn[] = txns) => {
+    accountsRef.current = next; setAccounts(next);
+    await saveAccounts(next);
+    await persist(withTransfers(txnList));
+  };
+  const onSaveAccount = async (a: Account) => {
+    const exists = accounts.some(x => x.id === a.id);
+    await applyAccounts(exists ? accounts.map(x => (x.id === a.id ? a : x)) : [...accounts, a]);
+    setAccSheet(null);
+  };
+  const onDeleteAccount = async (a: Account) => {
+    await applyAccounts(accounts.filter(x => x.id !== a.id), txns.map(t => (t.accountId === a.id ? { ...t, accountId: undefined } : t)));
+    if (accFilter === a.id) setAccFilter(null);
+    setAccSheet(null);
+  };
+  const accName = (t: Txn) => accountFor(t, accounts)?.name;
+
   const deleteTxn = async (id: string) => { await persist(txns.filter(t => t.id !== id)); setSelected(null); };
 
-  const addEntry = async (type: 'debit' | 'credit', amount: number, note: string, category: string, narration: string) => {
+  const addEntry = async (type: 'debit' | 'credit', amount: number, note: string, category: string, narration: string, accountId?: string) => {
+    const acc = accounts.find(a => a.id === accountId);
+    const cash = !acc || acc.kind === 'cash';
     const t: Txn = {
       id: `cash-${Date.now()}`, date: Date.now(), amount, type,
-      merchant: note || (type === 'debit' ? 'Cash expense' : 'Cash received'),
-      mode: 'Cash', category, manual: true, note: narration || undefined,
+      merchant: note || (type === 'debit' ? (cash ? 'Cash expense' : 'Payment') : (cash ? 'Cash received' : 'Received')),
+      mode: cash ? 'Cash' : 'Other', category, manual: true, note: narration || undefined,
+      accountId: acc ? acc.id : accountId === 'none' ? 'none' : undefined,
     };
     await persist([t, ...txns]);
     setAdding(false);
@@ -348,16 +384,17 @@ function Main() {
   }, [monthTx]);
 
   const listTx = useMemo(
-    () => monthTx.filter(t => (filter === 'all' || t.type === filter) && (!catFilter || t.category === catFilter)),
-    [monthTx, filter, catFilter],
+    () => monthTx.filter(t => (filter === 'all' || t.type === filter) && (!catFilter || t.category === catFilter)
+      && (!accFilter || accountFor(t, accounts)?.id === accFilter)),
+    [monthTx, filter, catFilter, accFilter, accounts],
   );
 
   const exportCsv = async () => {
     const q = (s: unknown) => `"${String(s ?? '').replace(/"/g, '""')}"`;
-    const rows = [['Date', 'Type', 'Amount', 'Payee', 'Narration', 'Category', 'Mode', 'Bank', 'Account', 'Reference', 'Counted']];
+    const rows = [['Date', 'Type', 'Amount', 'Payee', 'Narration', 'Category', 'Mode', 'Account', 'Bank', 'A/c no.', 'Reference', 'Counted']];
     for (const t of [...monthTx].reverse()) {
       rows.push([fmtDay(t.date), t.type === 'debit' ? 'Paid' : 'Received', t.amount.toFixed(2), t.merchant, t.note ?? '', t.category, t.mode,
-        t.bank ?? '', t.account ? `xx${t.account}` : '', t.ref ?? '', t.excluded ? 'No' : 'Yes']);
+        accName(t) ?? '', t.bank ?? '', t.account ? `xx${t.account}` : '', t.ref ?? '', t.excluded ? 'No' : 'Yes']);
     }
     await Share.share({ title: `Kanakku ${monthLabel(month)}`, message: rows.map(r => r.map(q).join(',')).join('\n') });
   };
@@ -492,6 +529,10 @@ function Main() {
             <Btn label="Manage categories" onPress={() => setManaging(true)} />
           </View>
         </ScrollView>
+      ) : tab === 'accounts' ? (
+        <AccountsTab accounts={accounts} txns={txns} monthStart={month} monthEnd={shiftMonth(month, 1)}
+          onOpen={a => setAccSheet({ account: a })} onAdd={draft => setAccSheet({ account: null, draft })}
+          onViewEntries={a => { setAccFilter(a.id); setCatFilter(null); setFilter('all'); setTab('txns'); }} />
       ) : (
         <View style={s.fill}>
           <View style={s.chips}>
@@ -499,13 +540,14 @@ function Main() {
               <Chip key={f} label={f === 'all' ? 'All' : f === 'debit' ? 'Paid' : 'Received'} on={filter === f} onPress={() => setFilter(f)} />
             ))}
             {catFilter && <Chip label={`${catFilter}  ✕`} on onPress={() => setCatFilter(null)} />}
+            {accFilter && <Chip label={`${accounts.find(a => a.id === accFilter)?.name ?? 'Account'}  ✕`} on onPress={() => setAccFilter(null)} />}
           </View>
           <FlatList
             data={listTx}
             keyExtractor={t => t.id}
             contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 120 }}
             ListEmptyComponent={<Text style={[s.mute, { textAlign: 'center', marginTop: 40 }]}>No entries for this month.</Text>}
-            renderItem={({ item: t }) => <TxnRow t={t} onPress={() => setSelected(t)} />}
+            renderItem={({ item: t }) => <TxnRow t={t} accName={accName(t)} onPress={() => setSelected(t)} />}
           />
         </View>
       )}
@@ -517,10 +559,11 @@ function Main() {
       <View style={[s.tabs, { paddingBottom: insets.bottom + 6 }]}>
         <TabBtn label="Overview" on={tab === 'overview'} onPress={() => setTab('overview')} />
         <TabBtn label="Transactions" on={tab === 'txns'} onPress={() => setTab('txns')} />
+        <TabBtn label="Accounts" on={tab === 'accounts'} onPress={() => setTab('accounts')} />
       </View>
 
-      <TxnModal t={selected} cats={cats} onNewCat={openNewCat} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
-      <EntryModal visible={adding} cats={cats} onNewCat={openNewCat} onClose={() => setAdding(false)} onSave={addEntry} />
+      <TxnModal t={selected} cats={cats} accounts={accounts} onNewCat={openNewCat} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
+      <EntryModal visible={adding} cats={cats} accounts={accounts} onNewCat={openNewCat} onClose={() => setAdding(false)} onSave={addEntry} />
       <CategoriesModal visible={managing} cats={cats} onNew={() => setNewCat({ income: false, switchable: true })} onDelete={deleteCategory} onClose={() => setManaging(false)} />
       <Sheet visible={!!restoreList} onClose={() => setRestoreList(null)} footer={<>
         <Btn label="From a file" onPress={onRestoreFile} />
@@ -540,13 +583,16 @@ function Main() {
           </Pressable>
         ))}
       </Sheet>
+      <AccountSheet visible={!!accSheet} account={accSheet?.account ?? null} draft={accSheet?.draft}
+        balanceNow={accSheet?.account ? balanceOf(accSheet.account, txns, accounts, month, shiftMonth(month, 1)).value : undefined}
+        onSave={onSaveAccount} onDelete={onDeleteAccount} onClose={() => setAccSheet(null)} />
       <NewCategorySheet visible={!!newCat} income={newCat?.income ?? false} allowTypeSwitch={newCat?.switchable} onAdd={addCategory}
         onDone={name => { const cb = newCat?.onCreated; setNewCat(null); if (name && cb) cb(name); }} />
     </View>
   );
 }
 
-function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
+function TxnRow({ t, accName, onPress }: { t: Txn; accName?: string; onPress: () => void }) {
   const m = catMeta(t.category);
   return (
     <Pressable style={[s.txn, t.excluded && { opacity: 0.45 }]} onPress={onPress}>
@@ -554,7 +600,7 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
       <View style={{ flex: 1 }}>
         <Text style={s.txnName} numberOfLines={1}>{t.merchant}</Text>
         <Text style={s.txnMeta} numberOfLines={1}>
-          {t.source === 'email' ? '✉ ' : ''}{t.category} · {t.mode}{t.bank ? ` · ${t.bank}` : ''}{t.account ? ` xx${t.account}` : ''}
+          {t.source === 'email' ? '✉ ' : ''}{t.selfTransfer ? '⇄ ' : ''}{t.category} · {accName ?? `${t.mode}${t.bank ? ` · ${t.bank}` : ''}${t.account ? ` xx${t.account}` : ''}`}
         </Text>
         {!!t.note && <Text style={s.txnNote} numberOfLines={2}>✎ {t.note}</Text>}
       </View>
@@ -566,52 +612,6 @@ function TxnRow({ t, onPress }: { t: Txn; onPress: () => void }) {
       </View>
     </Pressable>
   );
-}
-
-/**
- * Bottom sheet drawn inside the main screen (not a separate Android window), so typing never freezes it.
- * Buttons sit in a fixed footer above the navigation bar and the keyboard; the Back key closes it.
- */
-function Sheet({ visible, onClose, children, footer }: {
-  visible: boolean; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode;
-}) {
-  const insets = useSafeAreaInsets();
-  const kbTop = useKeyboardTop();
-  const [rootH, setRootH] = useState(0);
-  const closeRef = useRef(onClose);
-  closeRef.current = onClose;
-  useEffect(() => {
-    if (!visible) return;
-    const sub = BackHandler.addEventListener('hardwareBackPress', () => { closeRef.current(); return true; });
-    return () => sub.remove();
-  }, [visible]);
-  if (!visible) return null;
-  // Lift the sheet by however much the keyboard covers it.
-  const covered = kbTop != null && rootH > 0 ? Math.max(0, rootH - kbTop) : 0;
-  const bottom = covered > 0 ? covered + 8 : Math.max(insets.bottom, NAV_BAR_MIN) + 12;
-  return (
-    <View style={[StyleSheet.absoluteFill, { zIndex: 10, elevation: 10 }]} onLayout={e => setRootH(e.nativeEvent.layout.height)}>
-      <Pressable style={s.backdrop} onPress={() => { Keyboard.dismiss(); onClose(); }} />
-      <View style={[s.sheet, { paddingBottom: bottom, maxHeight: '92%' }]}>
-        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{children}</ScrollView>
-        {footer && <View style={s.footer}>{footer}</View>}
-      </View>
-    </View>
-  );
-}
-
-// Space kept clear for the phone's navigation bar (3-button bar is ~48dp), even if the system reports less.
-const NAV_BAR_MIN = 48;
-
-/** Screen Y of the keyboard's top edge, or null when the keyboard is closed. */
-function useKeyboardTop() {
-  const [top, setTop] = useState<number | null>(null);
-  useEffect(() => {
-    const show = Keyboard.addListener('keyboardDidShow', e => setTop(e.endCoordinates.screenY));
-    const hide = Keyboard.addListener('keyboardDidHide', () => setTop(null));
-    return () => { show.remove(); hide.remove(); };
-  }, []);
-  return top;
 }
 
 /** Separate sheet for creating a category; its Add button sits in the fixed footer so it is never hidden. */
@@ -669,8 +669,8 @@ function CategoryPicker({ list, value, onPick, onNew }: {
 
 type NewCatFn = (income: boolean, onCreated: (name: string) => void) => void;
 
-function TxnModal({ t, cats, onNewCat, onClose, onUpdate, onDelete }: {
-  t: Txn | null; cats: CustomCategory[]; onNewCat: NewCatFn; onClose: () => void;
+function TxnModal({ t, cats, accounts, onNewCat, onClose, onUpdate, onDelete }: {
+  t: Txn | null; cats: CustomCategory[]; accounts: Account[]; onNewCat: NewCatFn; onClose: () => void;
   onUpdate: (id: string, p: Partial<Txn>, remember: boolean) => void; onDelete: (id: string) => void;
 }) {
   const [remember, setRemember] = useState(true);
@@ -699,7 +699,16 @@ function TxnModal({ t, cats, onNewCat, onClose, onUpdate, onDelete }: {
       <TextInput style={[s.input, s.noteInput]} placeholder="Add a note (e.g. Mother's medicine, shop rent Nov)" placeholderTextColor={C.mute}
         value={note} onChangeText={setNote} onEndEditing={saveNote} multiline maxLength={200} />
 
-      <Text style={[s.label, { marginTop: 8 }]}>CATEGORY</Text>
+      <Text style={[s.label, { marginTop: 8 }]}>ACCOUNT</Text>
+      <AccountPicker accounts={accounts} value={accountFor(t, accounts)?.id} allowNone onPick={id => onUpdate(t.id, { accountId: id }, false)} />
+      {(() => {
+        const r = reported(t);
+        const parts = [r.balance != null && `Balance after: ${inr(r.balance, true)}`, r.availLimit != null && `Available limit: ${inr(r.availLimit, true)}`].filter(Boolean);
+        return parts.length ? <Text style={[s.mute, { marginTop: 6 }]}>{parts.join(' · ')}</Text> : null;
+      })()}
+      {t.selfTransfer && <Text style={[s.mute, { marginTop: 6, color: C.gold }]}>⇄ Move between your own accounts, left out of totals</Text>}
+
+      <Text style={[s.label, { marginTop: 14 }]}>CATEGORY</Text>
       <CategoryPicker list={list} value={t.category}
         onNew={() => onNewCat(income, name => onUpdate(t.id, { category: name }, remember))}
         onPick={name => onUpdate(t.id, { category: name, ...(name === 'Card Bill' ? { excluded: true } : {}) }, remember)} />
@@ -724,10 +733,12 @@ function TxnModal({ t, cats, onNewCat, onClose, onUpdate, onDelete }: {
   );
 }
 
-function EntryModal({ visible, cats, onNewCat, onClose, onSave }: {
-  visible: boolean; cats: CustomCategory[]; onNewCat: NewCatFn; onClose: () => void;
-  onSave: (type: 'debit' | 'credit', a: number, n: string, c: string, narration: string) => void;
+function EntryModal({ visible, cats, accounts, onNewCat, onClose, onSave }: {
+  visible: boolean; cats: CustomCategory[]; accounts: Account[]; onNewCat: NewCatFn; onClose: () => void;
+  onSave: (type: 'debit' | 'credit', a: number, n: string, c: string, narration: string, accountId?: string) => void;
 }) {
+  const [accountId, setAccountId] = useState<string | undefined>(undefined);
+  useEffect(() => { if (visible) setAccountId(accounts.find(a => a.kind === 'cash')?.id); }, [visible]);
   const [type, setType] = useState<'debit' | 'credit'>('debit');
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
@@ -740,7 +751,7 @@ function EntryModal({ visible, cats, onNewCat, onClose, onSave }: {
     const a = parseFloat(amount.replace(/,/g, ''));
     if (!(a > 0)) { Alert.alert('Enter an amount'); return; }
     Keyboard.dismiss();
-    onSave(type, a, note.trim(), cat, narration.trim());
+    onSave(type, a, note.trim(), cat, narration.trim(), accountId);
     setAmount(''); setNote(''); setNarration('');
   };
   return (
@@ -756,6 +767,14 @@ function EntryModal({ visible, cats, onNewCat, onClose, onSave }: {
       <TextInput style={s.input} placeholder="Amount (₹)" placeholderTextColor={C.mute} keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
       <TextInput style={s.input} placeholder={income ? 'Received from (e.g. Tenant)' : 'Paid to / for (e.g. Vegetable shop)'} placeholderTextColor={C.mute} value={note} onChangeText={setNote} />
       <TextInput style={[s.input, s.noteInput]} placeholder="Narration (optional details)" placeholderTextColor={C.mute} value={narration} onChangeText={setNarration} multiline maxLength={200} />
+      {accounts.length > 0 && (
+        <>
+          <Text style={s.label}>{income ? 'RECEIVED INTO' : 'PAID FROM'}</Text>
+          <View style={{ marginBottom: 12 }}>
+            <AccountPicker accounts={accounts} value={accountId === 'none' ? undefined : accountId} allowNone onPick={setAccountId} />
+          </View>
+        </>
+      )}
       <Text style={s.label}>CATEGORY</Text>
       <CategoryPicker list={list} value={cat} onPick={setCat} onNew={() => onNewCat(income, setCat)} />
       {!income && <Text style={[s.mute, { marginTop: 10 }]}>Tip: mark ATM withdrawals “Leave out of totals” if you log cash spends here, so cash isn’t counted twice.</Text>}
@@ -792,84 +811,3 @@ function CategoriesModal({ visible, cats, onNew, onDelete, onClose }: {
     </Sheet>
   );
 }
-
-const Stat = ({ label, value, color }: { label: string; value: string; color?: string }) => (
-  <View style={{ flex: 1 }}>
-    <Text style={s.label}>{label.toUpperCase()}</Text>
-    <Text style={[s.statVal, color ? { color } : null]}>{value}</Text>
-  </View>
-);
-const Chip = ({ label, on, onPress }: { label: string; on?: boolean; onPress: () => void }) => (
-  <Pressable onPress={onPress} style={[s.chip, on && s.chipOn]}><Text style={[s.chipText, on && { color: C.bg }]}>{label}</Text></Pressable>
-);
-const Btn = ({ label, onPress, primary, danger, disabled }: { label: string; onPress: () => void; primary?: boolean; danger?: boolean; disabled?: boolean }) => (
-  <Pressable disabled={disabled} onPress={onPress}
-    style={[s.btn, primary && { backgroundColor: C.gold, borderColor: C.gold }, danger && { borderColor: C.red }, disabled && { opacity: 0.5 }]}>
-    <Text style={[s.btnText, primary && { color: C.bg }, danger && { color: C.red }]}>{label}</Text>
-  </Pressable>
-);
-const TabBtn = ({ label, on, onPress }: { label: string; on: boolean; onPress: () => void }) => (
-  <Pressable style={s.tabBtn} onPress={onPress}>
-    <Text style={[s.tabText, on && { color: C.gold }]}>{label}</Text>
-    <View style={[s.tabLine, on && { backgroundColor: C.gold }]} />
-  </Pressable>
-);
-
-const serif = 'serif';
-const s = StyleSheet.create({
-  fill: { flex: 1, backgroundColor: C.bg },
-  center: { alignItems: 'center', justifyContent: 'center' },
-  header: { paddingHorizontal: 16, paddingTop: 12, flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
-  brand: { color: C.gold, fontSize: 30, fontFamily: serif, fontWeight: '600', letterSpacing: 0.5 },
-  sub: { color: C.mute, fontSize: 12 },
-  monthRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 8 },
-  month: { color: C.text, fontSize: 16, fontWeight: '600' },
-  arrow: { color: C.gold, fontSize: 30, paddingHorizontal: 8 },
-  card: { backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 1, borderColor: C.line },
-  label: { color: C.mute, fontSize: 11, letterSpacing: 1.2, marginBottom: 4 },
-  big: { color: C.gold, fontSize: 40, fontFamily: serif, fontWeight: '600', marginBottom: 14 },
-  row3: { flexDirection: 'row', gap: 10, borderTopWidth: 1, borderTopColor: C.line, paddingTop: 12 },
-  statVal: { color: C.text, fontSize: 15, fontWeight: '600' },
-  h2: { color: C.text, fontSize: 18, fontFamily: serif, fontWeight: '600', marginBottom: 10 },
-  body: { color: C.text, fontSize: 14, lineHeight: 20, flex: 1 },
-  mute: { color: C.mute, fontSize: 12 },
-  catRow: { marginBottom: 12 },
-  catTop: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  catName: { color: C.text, fontSize: 14 },
-  catAmt: { color: C.text, fontSize: 14, fontWeight: '600' },
-  track: { height: 6, backgroundColor: C.card2, borderRadius: 3, overflow: 'hidden' },
-  bar: { height: 6, borderRadius: 3 },
-  payee: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C.line },
-  payeeName: { color: C.text, flex: 1, fontSize: 14 },
-  btnRow: { flexDirection: 'row', gap: 10, marginTop: 14 },
-  btn: { flex: 1, borderWidth: 1, borderColor: C.goldDeep, borderRadius: 12, paddingVertical: 12, alignItems: 'center' },
-  btnText: { color: C.gold, fontWeight: '600', fontSize: 14 },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingHorizontal: 16, paddingBottom: 10 },
-  chip: { borderWidth: 1, borderColor: C.line, borderRadius: 20, paddingHorizontal: 12, paddingVertical: 7, backgroundColor: C.card },
-  chipOn: { backgroundColor: C.gold, borderColor: C.gold },
-  chipText: { color: C.text, fontSize: 13 },
-  txn: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.line },
-  dot: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
-  txnName: { color: C.text, fontSize: 15, fontWeight: '500' },
-  txnMeta: { color: C.mute, fontSize: 12, marginTop: 2 },
-  txnAmt: { fontSize: 15, fontWeight: '600' },
-  fab: { position: 'absolute', right: 16, backgroundColor: C.gold, borderRadius: 26, paddingHorizontal: 18, paddingVertical: 12, elevation: 6 },
-  fabText: { color: C.bg, fontWeight: '700' },
-  tabs: { flexDirection: 'row', backgroundColor: C.card, borderTopWidth: 1, borderTopColor: C.line },
-  tabBtn: { flex: 1, alignItems: 'center', paddingTop: 12 },
-  tabText: { color: C.mute, fontSize: 14, fontWeight: '600' },
-  tabLine: { height: 2, width: 28, marginTop: 6, borderRadius: 1, backgroundColor: 'transparent' },
-  backdrop: { flex: 1, backgroundColor: '#0009' },
-  sheet: { backgroundColor: C.card, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 20, paddingTop: 20, maxHeight: '88%', borderTopWidth: 1, borderColor: C.line },
-  footer: { flexDirection: 'row', gap: 10, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.line, marginTop: 8 },
-  txnNote: { color: C.gold, fontSize: 12, marginTop: 3, fontStyle: 'italic' },
-  noteInput: { minHeight: 48, textAlignVertical: 'top' },
-  newForm: { backgroundColor: C.card2, borderRadius: 12, padding: 12, marginTop: 10, borderWidth: 1, borderColor: C.line },
-  iconCell: { width: 40, height: 40, borderRadius: 10, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'transparent' },
-  manageRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.line, gap: 10 },
-  sheetAmt: { color: C.gold, fontSize: 32, fontFamily: serif, fontWeight: '600', marginBottom: 4 },
-  catGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  switchRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 16 },
-  smsBox: { color: C.mute, fontSize: 12, lineHeight: 18, backgroundColor: C.card2, borderRadius: 10, padding: 12 },
-  input: { backgroundColor: C.card2, color: C.text, borderRadius: 12, padding: 14, fontSize: 16, marginBottom: 10, borderWidth: 1, borderColor: C.line },
-});

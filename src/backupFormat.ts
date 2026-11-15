@@ -1,5 +1,6 @@
 import type { Txn } from './parser';
 import type { CustomCategory } from './categories';
+import type { Account } from './accounts';
 
 export interface Snapshot {
   txns: Txn[];
@@ -7,6 +8,7 @@ export interface Snapshot {
   cats: CustomCategory[];
   lastScan: number;
   mailLastScan: number;
+  accounts?: Account[];
 }
 
 const APP = 'kanakku';
@@ -29,6 +31,7 @@ export function parseBackup(text: string): Snapshot & { createdAt: number } {
     cats: Array.isArray(d.cats) ? d.cats : [],
     lastScan: Number(d.lastScan) || 0,
     mailLastScan: Number(d.mailLastScan) || 0,
+    accounts: Array.isArray(d.accounts) ? d.accounts : [],
     createdAt: Number(d.createdAt) || 0,
   };
 }

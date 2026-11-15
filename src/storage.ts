@@ -4,6 +4,7 @@ import type { Txn } from './parser';
 import type { CustomCategory } from './categories';
 import { diffTxns } from './storeDiff';
 import type { Snapshot } from './backupFormat';
+import type { Account } from './accounts';
 export { mergeTxns, applyRule } from './merge';
 
 export type Rules = Record<string, string>; // merchant (lowercase) -> category
@@ -116,11 +117,13 @@ export const loadMail = () => getKv<MailState>('mail', { account: null, lastScan
 export const saveMail = (m: MailState) => setKv('mail', m);
 export const loadBackupState = () => getKv<BackupState>('backup', { enabled: false, account: null, lastBackup: 0 });
 export const saveBackupState = (b: BackupState) => setKv('backup', b);
+export const loadAccounts = () => getKv<Account[]>('accounts', []);
+export const saveAccounts = (a: Account[]) => setKv('accounts', a);
 
 /** Everything a backup needs, read straight from the database. */
 export async function snapshot(): Promise<Snapshot> {
-  const [all, mail] = await Promise.all([loadAll(), loadMail()]);
-  return { txns: all.txns, rules: all.rules, cats: all.cats, lastScan: all.lastScan, mailLastScan: mail.lastScan };
+  const [all, mail, accounts] = await Promise.all([loadAll(), loadMail(), loadAccounts()]);
+  return { txns: all.txns, rules: all.rules, cats: all.cats, lastScan: all.lastScan, mailLastScan: mail.lastScan, accounts };
 }
 
 /** Replaces all data with a backup (used by Restore). */
@@ -135,6 +138,7 @@ export function replaceAll(s: Snapshot) {
       await put('rules', s.rules);
       await put('cats', s.cats);
       await put('lastScan', s.lastScan);
+      if (s.accounts) await put('accounts', s.accounts);
       const mail = await tx.getFirstAsync<{ value: string }>('SELECT value FROM kv WHERE key = ?', 'mail');
       const m: MailState = mail ? JSON.parse(mail.value) : { account: null, lastScan: 0 };
       await put('mail', { ...m, lastScan: s.mailLastScan });

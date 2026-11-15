@@ -35,6 +35,15 @@ Kanakku reads bank alert emails with read-only Gmail access. Google needs to kno
 
 While the Google app stays in *Testing*, Google asks you to sign in again about once a week — the app shows "Gmail sign-in has expired"; just tap Connect Gmail again.
 
+## Accounts
+- **Accounts tab**: bank accounts, credit cards, wallets and cash, with balances and card dues.
+- Accounts found in your SMS (bank + last digits) are suggested for one-tap adding.
+- Balance = the latest balance printed in a bank SMS ("Avl Bal …"), or the one you set, plus later entries.
+- Cards: amount due and available limit (from "Avl Limit" in SMS when present, else limit − spends + payments).
+- Cash wallet: ATM withdrawals go in, cash spends come out (ATM entries are then not counted as spending).
+- Moves between your own accounts (same amount out of one and into another within 3 hours, card bill payments) are left out of spending/income. Anything you change by hand is never overridden.
+- Link or re-link any entry from its detail screen; filter Transactions by account.
+
 ## Backup
 - Data is stored in an on-phone SQLite database (one row per entry). Older versions' data moves across automatically on first open.
 - **Turn on Drive backup** (Overview → Backup): saves to a private Kanakku folder in your Google Drive (`drive.appdata` — the app cannot see your other Drive files). Automatic every week, last 5 kept. **Back up now** any time.
