@@ -35,6 +35,13 @@ Kanakku reads bank alert emails with read-only Gmail access. Google needs to kno
 
 While the Google app stays in *Testing*, Google asks you to sign in again about once a week — the app shows "Gmail sign-in has expired"; just tap Connect Gmail again.
 
+## Backup
+- Data is stored in an on-phone SQLite database (one row per entry). Older versions' data moves across automatically on first open.
+- **Turn on Drive backup** (Overview → Backup): saves to a private Kanakku folder in your Google Drive (`drive.appdata` — the app cannot see your other Drive files). Automatic every week, last 5 kept. **Back up now** any time.
+- **Restore**: pick a Drive backup, or **From a file**. Restoring replaces what is on the phone.
+- **Save backup file**: share a `.json` copy anywhere (WhatsApp to yourself, Files, Drive).
+- One-time Google setup: enable the **Google Drive API** in the Kanakku Google Cloud project (kanakku-513517).
+
 ## Updates
 Every APK is signed with the same key (`credentials/kanakku.keystore`) and gets a higher version number, so a new build installs straight over the old one and keeps your data.
 

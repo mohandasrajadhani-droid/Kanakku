@@ -11,8 +11,15 @@ import {
 } from './src/categories';
 import { ensureSmsPermission, readInbox } from './src/sms';
 import {
-  applyRule, loadAll, loadMail, MailState, mergeTxns, Rules, saveCats, saveLastScan, saveMail, saveRules, saveTxns,
+  applyRule, BackupState, loadAll, loadBackupState, loadMail, MailState, mergeTxns, replaceAll, Rules, saveBackupState,
+  saveCats, saveLastScan, saveMail, saveRules, saveTxns, snapshot,
 } from './src/storage';
+import { File, Paths } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+import * as DocumentPicker from 'expo-document-picker';
+import { makeBackup, parseBackup } from './src/backupFormat';
+import { DriveBackup, downloadBackup, listBackups, uploadBackup } from './src/drive';
+import { ensureScope, SCOPES } from './src/google';
 import { connectGmail, disconnectGmail, fetchBankEmails } from './src/gmail';
 import { ago, C, fmtDate, fmtDay, inr, monthLabel } from './src/ui';
 
@@ -53,6 +60,9 @@ function Main() {
   const [selected, setSelected] = useState<Txn | null>(null);
   const [adding, setAdding] = useState(false);
   const [managing, setManaging] = useState(false);
+  const [backup, setBackup] = useState<BackupState>({ enabled: false, account: null, lastBackup: 0 });
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [restoreList, setRestoreList] = useState<DriveBackup[] | null>(null);
   const [newCat, setNewCat] = useState<{ income: boolean; switchable: boolean; onCreated?: (name: string) => void } | null>(null);
   const [cats, setCats] = useState<CustomCategory[]>([]);
   const [mail, setMail] = useState<MailState>({ account: null, lastScan: 0 });
@@ -121,25 +131,125 @@ function Main() {
     { text: 'Cancel', style: 'cancel' },
     {
       text: 'Disconnect', style: 'destructive', onPress: async () => {
-        await disconnectGmail();
+        await disconnectGmail(backup.enabled);
         const m = { account: null, lastScan: 0 };
         setMail(m); await saveMail(m);
       },
     },
   ]);
 
+  // ---------- Backup ----------
+  const runBackup = useCallback(async (b: BackupState, silent: boolean) => {
+    setBackupBusy(true);
+    try {
+      const snap = await snapshot();
+      await uploadBackup(makeBackup(snap));
+      const next = { ...b, lastBackup: Date.now() };
+      setBackup(next); await saveBackupState(next);
+      if (!silent) Alert.alert('Backup saved', `${snap.txns.length} entries backed up to Google Drive.`);
+    } catch (e: any) {
+      if (!silent) Alert.alert('Backup failed', String(e?.message ?? e));
+    } finally {
+      setBackupBusy(false);
+    }
+  }, []);
+
+  const onEnableBackup = async () => {
+    try {
+      const account = await ensureScope(SCOPES.drive);
+      if (!account) return;
+      const b = { enabled: true, account, lastBackup: 0 };
+      setBackup(b); await saveBackupState(b);
+      await runBackup(b, false);
+    } catch (e: any) {
+      Alert.alert('Could not turn on backup', String(e?.message ?? e));
+    }
+  };
+
+  const onDisableBackup = () => Alert.alert('Turn off Drive backup?', 'Backups already on Drive are kept.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Turn off', style: 'destructive', onPress: async () => { const b = { ...backup, enabled: false }; setBackup(b); await saveBackupState(b); } },
+  ]);
+
+  const onOpenRestore = async () => {
+    setBackupBusy(true);
+    try {
+      if (!(await ensureScope(SCOPES.drive))) return;
+      setRestoreList(await listBackups());
+    } catch (e: any) {
+      Alert.alert('Could not read backups', String(e?.message ?? e));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  /** Asks for confirmation, then replaces everything on the phone with the backup. */
+  const restoreFromText = (text: string) => {
+    let data: ReturnType<typeof parseBackup>;
+    try { data = parseBackup(text); } catch (e: any) { Alert.alert('Cannot restore', String(e?.message ?? e)); return; }
+    const when = data.createdAt ? fmtDate(data.createdAt) : 'unknown date';
+    Alert.alert('Restore this backup?', `Backup from ${when} has ${data.txns.length} entries.\nIt will replace the ${txns.length} entries now on this phone.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Restore', style: 'destructive', onPress: async () => {
+          await replaceAll(data);
+          const [d, m] = await Promise.all([loadAll(), loadMail()]);
+          registerCustom(d.cats);
+          setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m);
+          setRestoreList(null);
+          Alert.alert('Restored', `${d.txns.length} entries are back.`);
+        },
+      },
+    ]);
+  };
+
+  const onRestoreDrive = async (f: DriveBackup) => {
+    setBackupBusy(true);
+    try { restoreFromText(await downloadBackup(f.id)); } catch (e: any) { Alert.alert('Download failed', String(e?.message ?? e)); } finally { setBackupBusy(false); }
+  };
+
+  const onRestoreFile = async () => {
+    try {
+      const r = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'text/plain', 'application/octet-stream'], copyToCacheDirectory: true });
+      if (r.canceled || !r.assets?.[0]) return;
+      restoreFromText(await new File(r.assets[0].uri).text());
+    } catch (e: any) {
+      Alert.alert('Could not open file', String(e?.message ?? e));
+    }
+  };
+
+  const onShareBackup = async () => {
+    try {
+      const snap = await snapshot();
+      const f = new File(Paths.cache, `kanakku-backup-${fmtDay(Date.now())}.json`);
+      if (f.exists) f.delete();
+      f.write(makeBackup(snap));
+      await Sharing.shareAsync(f.uri, { mimeType: 'application/json', dialogTitle: 'Save Kanakku backup' });
+    } catch (e: any) {
+      Alert.alert('Could not create backup file', String(e?.message ?? e));
+    }
+  };
+
   // Load saved data, then pick up new SMS automatically.
   useEffect(() => {
     (async () => {
-      const [d, m] = await Promise.all([loadAll(), loadMail()]);
+      let d, m, b: BackupState;
+      try {
+        [d, m, b] = await Promise.all([loadAll(), loadMail(), loadBackupState()]);
+      } catch (e: any) {
+        Alert.alert('Could not open saved data', String(e?.message ?? e));
+        return;
+      }
       registerCustom(d.cats);
-      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m);
+      setTxns(d.txns); setRules(d.rules); setLastScan(d.lastScan); setCats(d.cats); setMail(m); setBackup(b);
       setReady(true);
       let cur = d.txns;
       if (d.lastScan) cur = await runScan(cur, d.rules, d.lastScan, true);
       if (m.account) await runMail(cur, d.rules, m, true);
+      // Weekly automatic backup.
+      if (b.enabled && Date.now() - b.lastBackup > 7 * DAY) await runBackup(b, true);
     })();
-  }, [runScan, runMail]);
+  }, [runScan, runMail, runBackup]);
 
   // Re-scan when the app comes back to the foreground.
   useEffect(() => {
@@ -347,6 +457,37 @@ function Main() {
             )}
           </View>
 
+          <View style={[s.card, { marginTop: 14 }]}>
+            <Text style={s.h2}>Backup</Text>
+            {backup.enabled ? (
+              <>
+                <Text style={s.body}>Google Drive: {backup.account}</Text>
+                <Text style={s.mute}>
+                  Last backup {backup.lastBackup ? ago(backup.lastBackup) : 'not yet'} · automatic every week · last 5 kept
+                </Text>
+                <View style={s.btnRow}>
+                  <Btn label={backupBusy ? 'Working…' : 'Back up now'} onPress={() => runBackup(backup, false)} disabled={backupBusy} primary />
+                  <Btn label="Restore" onPress={onOpenRestore} disabled={backupBusy} />
+                </View>
+                <View style={s.btnRow}>
+                  <Btn label="Save backup file" onPress={onShareBackup} />
+                  <Btn label="Turn off" onPress={onDisableBackup} danger />
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={s.body}>Your entries live only on this phone. Turn on backup to keep a copy in a private Kanakku folder on your Google Drive (only this app can see it).</Text>
+                <View style={s.btnRow}>
+                  <Btn label={backupBusy ? 'Working…' : 'Turn on Drive backup'} onPress={onEnableBackup} disabled={backupBusy} primary />
+                </View>
+                <View style={s.btnRow}>
+                  <Btn label="Save backup file" onPress={onShareBackup} />
+                  <Btn label="Restore" onPress={onOpenRestore} disabled={backupBusy} />
+                </View>
+              </>
+            )}
+          </View>
+
           <View style={s.btnRow}>
             <Btn label="Manage categories" onPress={() => setManaging(true)} />
           </View>
@@ -381,6 +522,24 @@ function Main() {
       <TxnModal t={selected} cats={cats} onNewCat={openNewCat} onClose={() => setSelected(null)} onUpdate={updateTxn} onDelete={deleteTxn} />
       <EntryModal visible={adding} cats={cats} onNewCat={openNewCat} onClose={() => setAdding(false)} onSave={addEntry} />
       <CategoriesModal visible={managing} cats={cats} onNew={() => setNewCat({ income: false, switchable: true })} onDelete={deleteCategory} onClose={() => setManaging(false)} />
+      <Sheet visible={!!restoreList} onClose={() => setRestoreList(null)} footer={<>
+        <Btn label="From a file" onPress={onRestoreFile} />
+        <Btn label="Close" onPress={() => setRestoreList(null)} primary />
+      </>}>
+        <Text style={s.h2}>Restore a backup</Text>
+        <Text style={s.mute}>Restoring replaces everything now on this phone.</Text>
+        {restoreList?.length === 0 && <Text style={[s.body, { marginTop: 12 }]}>No backups on Google Drive yet.</Text>}
+        {restoreList?.map(f => (
+          <Pressable key={f.id} style={s.manageRow} onPress={() => onRestoreDrive(f)} disabled={backupBusy}>
+            <Text style={{ fontSize: 18 }}>☁</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.body}>{fmtDate(new Date(f.createdTime).getTime())}</Text>
+              {f.size && <Text style={s.mute}>{Math.max(1, Math.round(Number(f.size) / 1024))} KB</Text>}
+            </View>
+            <Text style={{ color: C.gold, fontSize: 13 }}>{backupBusy ? '…' : 'Restore'}</Text>
+          </Pressable>
+        ))}
+      </Sheet>
       <NewCategorySheet visible={!!newCat} income={newCat?.income ?? false} allowTypeSwitch={newCat?.switchable} onAdd={addCategory}
         onDone={name => { const cb = newCat?.onCreated; setNewCat(null); if (name && cb) cb(name); }} />
     </View>

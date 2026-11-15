@@ -1,65 +1,21 @@
-import { GoogleSignin, isSuccessResponse } from '@react-native-google-signin/google-signin';
 import { parseEmail, RawEmail, Txn } from './parser';
 import { htmlToText } from './mailtext';
+import { ensureScope, googleFetch, SCOPES, signOutGoogle } from './google';
 
-const SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const MAX_MESSAGES = 400;
 
-let configured = false;
-function setup() {
-  if (!configured) { GoogleSignin.configure({ scopes: [SCOPE] }); configured = true; }
-}
-
-function explain(e: any): Error {
-  const code = String(e?.code ?? '');
-  if (code === '10' || /DEVELOPER_ERROR/i.test(String(e?.message))) {
-    return new Error('Google sign-in is not set up for this app yet. Finish the Google Cloud steps (Android client with package com.mohandas.kanakku and the SHA-1 in the README), then try again.');
-  }
-  return e instanceof Error ? e : new Error(String(e?.message ?? e));
-}
-
 /** Opens the Google account picker and asks for read-only Gmail access. Returns the email, or null if cancelled. */
-export async function connectGmail(): Promise<string | null> {
-  setup();
-  try {
-    await GoogleSignin.hasPlayServices();
-    const r = await GoogleSignin.signIn();
-    if (!isSuccessResponse(r)) return null;
-    if (!r.data.scopes?.includes(SCOPE)) {
-      const more = await GoogleSignin.addScopes({ scopes: [SCOPE] });
-      if (!more || !isSuccessResponse(more)) return null;
-    }
-    return r.data.user.email;
-  } catch (e) { throw explain(e); }
+export const connectGmail = () => ensureScope(SCOPES.gmail);
+
+/** Stops email reading. Google is fully signed out only when Drive backup is not using it. */
+export async function disconnectGmail(keepGoogle: boolean) {
+  if (!keepGoogle) await signOutGoogle();
 }
 
-export async function disconnectGmail() {
-  setup();
-  try { await GoogleSignin.revokeAccess(); } catch { /* already revoked */ }
-  try { await GoogleSignin.signOut(); } catch { /* ignore */ }
-}
-
-async function token(): Promise<string> {
-  setup();
-  try {
-    const r = await GoogleSignin.signInSilently();
-    if (r.type !== 'success') throw new Error('Gmail sign-in has expired. Tap “Connect Gmail” again.');
-    return (await GoogleSignin.getTokens()).accessToken;
-  } catch (e) { throw explain(e); }
-}
-
-async function api(path: string, tok: { v: string }): Promise<any> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch(`${API}/${path}`, { headers: { Authorization: `Bearer ${tok.v}` } });
-    if (res.status === 401 && attempt === 0) {
-      await GoogleSignin.clearCachedAccessToken(tok.v);
-      tok.v = await token();
-      continue;
-    }
-    if (!res.ok) throw new Error(`Gmail error ${res.status}`);
-    return res.json();
-  }
+async function api(path: string): Promise<any> {
+  const res = await googleFetch(`${API}/${path}`, {}, 'Gmail');
+  return res.json();
 }
 
 // ---------- decoding ----------
@@ -106,22 +62,21 @@ const header = (payload: any, name: string) =>
 
 /** Reads bank alert emails since `sinceMs` and returns the transactions found. Skips message ids already recorded. */
 export async function fetchBankEmails(sinceMs: number, seen: Set<string>): Promise<Txn[]> {
-  const tok = { v: await token() };
-  const days = Math.max(1, Math.ceil((Date.now() - sinceMs) / 86400000));
+    const days = Math.max(1, Math.ceil((Date.now() - sinceMs) / 86400000));
   const q = `newer_than:${days}d -category:promotions -category:social -in:sent `
     + '{debited credited spent "transaction alert" "has been debited" "has been credited" "UPI transaction" "card ending" "account ending"}';
 
   const ids: string[] = [];
   let pageToken = '';
   do {
-    const r = await api(`messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${pageToken}` : ''}`, tok);
+    const r = await api(`messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${pageToken}` : ''}`);
     for (const m of r.messages || []) if (!seen.has(`mail-${m.id}`)) ids.push(m.id);
     pageToken = r.nextPageToken || '';
   } while (pageToken && ids.length < MAX_MESSAGES);
 
   const out: Txn[] = [];
   for (let i = 0; i < ids.length; i += 8) {
-    const batch = await Promise.all(ids.slice(i, i + 8).map(id => api(`messages/${id}?format=full`, tok).catch(() => null)));
+    const batch = await Promise.all(ids.slice(i, i + 8).map(id => api(`messages/${id}?format=full`).catch(() => null)));
     for (const m of batch) {
       if (!m) continue;
       const mail: RawEmail = {
