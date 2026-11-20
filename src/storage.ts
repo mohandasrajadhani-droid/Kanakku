@@ -4,7 +4,7 @@ import type { Txn } from './parser';
 import type { CustomCategory } from './categories';
 import { diffTxns } from './storeDiff';
 import type { Snapshot } from './backupFormat';
-import type { Account } from './accounts';
+import type { Account, BalanceAlert } from './accounts';
 export { mergeTxns, applyRule } from './merge';
 
 export type Rules = Record<string, string>; // merchant (lowercase) -> category
@@ -118,6 +118,9 @@ export const saveMail = (m: MailState) => setKv('mail', m);
 export const loadBackupState = () => getKv<BackupState>('backup', { enabled: false, account: null, lastBackup: 0 });
 export const saveBackupState = (b: BackupState) => setKv('backup', b);
 export const loadAccounts = () => getKv<Account[]>('accounts', []);
+export const loadBalanceAlerts = () => getKv<BalanceAlert[]>('balanceAlerts', []);
+/** Keeps the newest 300 balance-only alerts. */
+export const saveBalanceAlerts = (a: BalanceAlert[]) => setKv('balanceAlerts', [...a].sort((x, y) => y.date - x.date).slice(0, 300));
 export const saveAccounts = (a: Account[]) => setKv('accounts', a);
 
 /** Everything a backup needs, read straight from the database. */

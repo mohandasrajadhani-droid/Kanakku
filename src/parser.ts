@@ -110,7 +110,7 @@ function detectMode(body: string): Mode {
   return 'Other';
 }
 
-function extractAccount(body: string): string | undefined {
+export function extractAccount(body: string): string | undefined {
   const m = /(?:a\/c|\bac\b|\bacct\b|account|\bcard\b)\s*(?:no\.?|number|ending(?: with)?)?\s*[:\-]?\s*[x*.]*\s*(\d{3,6})\b/i.exec(body);
   return m ? m[1].slice(-4) : undefined;
 }

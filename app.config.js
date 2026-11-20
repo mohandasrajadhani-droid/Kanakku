@@ -5,7 +5,7 @@ module.exports = {
   expo: {
     name: 'Kanakku',
     slug: 'kanakku',
-    version: '1.3.0',
+    version: '1.4.0',
     orientation: 'portrait',
     userInterfaceStyle: 'dark',
     newArchEnabled: false,

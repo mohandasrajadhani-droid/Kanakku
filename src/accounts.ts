@@ -1,4 +1,4 @@
-import type { Txn } from './parser';
+import { bankFromSender, extractAccount, RawSms, Txn } from './parser';
 
 export type AccountKind = 'bank' | 'card' | 'cash' | 'wallet';
 
@@ -12,7 +12,11 @@ export interface Account {
   openingAt: number;  // ... and when
   limit?: number;     // credit limit (cards)
   atmToCash?: boolean; // cash wallet: ATM withdrawals go in here and are not counted as spending
+  checkNumber?: string; // missed-call balance enquiry number
 }
+
+/** A balance the bank reported in an SMS that had no payment in it (e.g. the reply to a balance check). */
+export interface BalanceAlert { id: string; date: number; bank?: string; last4?: string; balance: number }
 
 export const KINDS: Record<AccountKind, { icon: string; label: string }> = {
   bank: { icon: '🏦', label: 'Bank account' },
@@ -35,9 +39,24 @@ export function accountFor(t: Txn, accounts: Account[]): Account | undefined {
 
 const NUM = '([0-9][0-9,]*(?:\\.[0-9]{1,2})?)';
 const CUR = '(?:rs\\.?|inr|₹)\\s*';
-const BAL_RE = new RegExp(`(?:avl\\.?|avail(?:able)?|a\\/c|clear|ledger|total)?\\s*bal(?:ance)?\\.?\\s*(?:is|:|-|of)?\\s*${CUR}(-)?\\s*${NUM}`, 'i');
+const DRCR = '(?:\\s*(cr|dr)\\b)?';
+// "Bal Rs 38659.61", "Avl Bal: INR 1,20,000.00", "Has Bal of INR 10,000"
+const BAL_RE = new RegExp(`(?:avl\\.?|avail(?:able)?|a\\/c|clear|ledger|total)?\\s*bal(?:ance)?\\.?\\s*(?:is|:|-|of)?\\s*${CUR}(-)?\\s*${NUM}${DRCR}`, 'i');
+// "Avl Bal in A/c XX5501 as on 20-11-2026 is Rs 38659.61", "Available Bal in HDFC Bank A/c XX12 as on 20-NOV-26 INR 1,000.00"
+const BAL_FAR_RE = new RegExp(`\\bbal(?:ance)?\\b(?:(?!\\b(?:rs|inr|limit|due)\\b|₹).){0,70}?${CUR}(-)?\\s*${NUM}${DRCR}`, 'i');
 const LIMIT_RE = new RegExp(`(?:avl\\.?|avail(?:able)?)\\s*(?:credit\\s*)?(?:limit|lmt)\\.?\\s*(?:is|:|-)?\\s*${CUR}${NUM}`, 'i');
 const num = (s: string) => parseFloat(s.replace(/,/g, ''));
+
+/** Account balance stated in a message, if any. */
+export function extractBalance(body: string): number | undefined {
+  for (const re of [BAL_RE, BAL_FAR_RE]) {
+    const b = re.exec(body);
+    if (!b || /limit|due|min/i.test(body.slice(Math.max(0, b.index - 12), b.index + 6))) continue;
+    const negative = !!b[1] || /^dr$/i.test(b[3] ?? '');
+    return (negative ? -1 : 1) * num(b[2]);
+  }
+  return undefined;
+}
 
 /** Balance or available card limit that the bank stated in the message, if any. */
 export function reported(t: Txn): { balance?: number; availLimit?: number } {
@@ -45,16 +64,33 @@ export function reported(t: Txn): { balance?: number; availLimit?: number } {
   const out: { balance?: number; availLimit?: number } = {};
   const l = LIMIT_RE.exec(body);
   if (l) out.availLimit = num(l[1]);
-  const b = BAL_RE.exec(body);
-  if (b && !/limit/i.test(body.slice(Math.max(0, b.index - 12), b.index + 4))) out.balance = (b[1] ? -1 : 1) * num(b[2]);
+  const bal = extractBalance(body);
+  if (bal != null && out.availLimit == null) out.balance = bal;
   return out;
 }
+
+/** Reads a balance-only bank SMS (no payment in it). Call only for messages that were not a transaction. */
+export function parseBalanceAlert(sms: RawSms): BalanceAlert | null {
+  const body = (sms.body || '').replace(/\s+/g, ' ').trim();
+  const address = (sms.address || '').trim();
+  if (/^\+?\d{7,}$/.test(address.replace(/\s/g, ''))) return null;
+  if (/\b(otp|offer|loan|apply|pre-?approved|limit|due)\b/i.test(body)) return null;
+  const balance = extractBalance(body);
+  if (balance == null) return null;
+  const last4 = extractAccount(body);
+  if (!last4) return null;
+  return { id: `bal-${sms._id}`, date: Number(sms.date) || Date.now(), bank: bankFromSender(address), last4, balance };
+}
+
+export const alertMatches = (a: BalanceAlert, acc: Account) =>
+  !!acc.last4 && !!a.last4 && digitsMatch(acc.last4, a.last4) && sameBank(acc.bank, a.bank);
 
 export interface Balance {
   value: number;            // bank/cash/wallet: money in it; card: amount due
   source: 'bank' | 'you';   // where the starting figure came from
   sourceAt: number;         // when that figure was true
   later: number;            // entries added on top of it
+  steps: { id: string; date: number; label: string; amount: number }[]; // the entries added, oldest first
   available?: number;       // cards: limit left
   monthIn: number;
   monthOut: number;
@@ -72,7 +108,7 @@ const isAtmIntoCash = (t: Txn, acc: Account) => acc.kind === 'cash' && !!acc.atm
  * Current balance of one account. Starts from the latest known figure — the balance printed in a bank SMS,
  * or the one you entered, whichever is newer — and adds the entries after it.
  */
-export function balanceOf(acc: Account, txns: Txn[], accounts: Account[], monthStart: number, monthEnd: number): Balance {
+export function balanceOf(acc: Account, txns: Txn[], accounts: Account[], monthStart: number, monthEnd: number, alerts: BalanceAlert[] = []): Balance {
   const own = txns.filter(t => accountFor(t, accounts)?.id === acc.id);
   const atmIn = acc.kind === 'cash' && acc.atmToCash ? txns.filter(t => isAtmIntoCash(t, acc)) : [];
   const moves = [...own, ...atmIn].sort((a, b) => a.date - b.date);
@@ -95,13 +131,19 @@ export function balanceOf(acc: Account, txns: Txn[], accounts: Account[], monthS
       anchor = { value: r.balance, at: t.date, source: 'bank', id: t.id };
     }
   }
+  if (acc.kind !== 'card' && acc.kind !== 'cash') {
+    for (const a of alerts) {
+      if (a.date >= anchor.at && alertMatches(a, acc)) anchor = { value: a.balance, at: a.date, source: 'bank', id: a.id };
+    }
+  }
   let value = anchor.value;
-  let later = 0;
+  const steps: Balance['steps'] = [];
   for (const t of moves) {
     if (t.date < anchor.at || t.id === anchor.id) continue;
     if (t.date === anchor.at && anchor.source === 'you') continue;
-    value += effect(t);
-    later++;
+    const e = effect(t);
+    value += e;
+    steps.push({ id: t.id, date: t.date, label: t.merchant, amount: e });
   }
   if (acc.kind === 'card' && acc.limit) available = acc.limit - value;
 
@@ -116,7 +158,8 @@ export function balanceOf(acc: Account, txns: Txn[], accounts: Account[], monthS
     value: Math.round(value * 100) / 100,
     source: anchor.source,
     sourceAt: anchor.at,
-    later,
+    later: steps.length,
+    steps,
     available,
     monthIn, monthOut,
     entries: moves.length,

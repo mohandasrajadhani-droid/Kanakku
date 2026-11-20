@@ -43,6 +43,8 @@ While the Google app stays in *Testing*, Google asks you to sign in again about 
 - Cash wallet: ATM withdrawals go in, cash spends come out (ATM entries are then not counted as spending).
 - Moves between your own accounts (same amount out of one and into another within 3 hours, card bill payments) are left out of spending/income. Anything you change by hand is never overridden.
 - Link or re-link any entry from its detail screen; filter Transactions by account.
+- **Check balance with bank** (bank accounts): opens the dialer with the bank's missed-call balance number (editable per account). The bank's reply SMS is read automatically and resets the balance. Balance-only SMS are always used this way.
+- Tap an account → **Show how this was worked out**: the starting figure and every entry added after it.
 
 ## Backup
 - Data is stored in an on-phone SQLite database (one row per entry). Older versions' data moves across automatically on first open.

@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import type { Txn } from './parser';
-import { Account, AccountKind, Balance, balanceOf, detectAccounts, KINDS, Suggestion } from './accounts';
+import { Account, AccountKind, Balance, BalanceAlert, balanceOf, detectAccounts, KINDS, Suggestion } from './accounts';
+import { BALANCE_NUMBERS, checkNumberFor } from './balanceCheck';
 import { Btn, Chip, s, Sheet } from './kit';
 import { C, fmtDate, inr } from './ui';
 
@@ -15,13 +16,13 @@ function describe(acc: Account, b: Balance): string {
 }
 
 /** The Accounts tab: totals, accounts found in messages, and each account with its balance. */
-export function AccountsTab({ accounts, txns, monthStart, monthEnd, onOpen, onAdd, onViewEntries }: {
-  accounts: Account[]; txns: Txn[]; monthStart: number; monthEnd: number;
-  onOpen: (a: Account) => void; onAdd: (draft?: Partial<Account>) => void; onViewEntries: (a: Account) => void;
+export function AccountsTab({ accounts, txns, alerts, monthStart, monthEnd, checkingId, onOpen, onAdd, onViewEntries, onCheck }: {
+  accounts: Account[]; txns: Txn[]; alerts: BalanceAlert[]; monthStart: number; monthEnd: number; checkingId?: string | null;
+  onOpen: (a: Account) => void; onAdd: (draft?: Partial<Account>) => void; onViewEntries: (a: Account) => void; onCheck: (a: Account) => void;
 }) {
   const balances = useMemo(
-    () => new Map(accounts.map(a => [a.id, balanceOf(a, txns, accounts, monthStart, monthEnd)])),
-    [accounts, txns, monthStart, monthEnd],
+    () => new Map(accounts.map(a => [a.id, balanceOf(a, txns, accounts, monthStart, monthEnd, alerts)])),
+    [accounts, txns, monthStart, monthEnd, alerts],
   );
   const suggestions = useMemo(() => detectAccounts(txns, accounts), [txns, accounts]);
   const money = accounts.filter(a => a.kind !== 'card').reduce((sum, a) => sum + (balances.get(a.id)?.value ?? 0), 0);
@@ -94,6 +95,11 @@ export function AccountsTab({ accounts, txns, monthStart, monthEnd, onOpen, onAd
               <Text style={s.mute}>This month: <Text style={{ color: C.green }}>+{inr(b.monthIn)}</Text>  <Text style={{ color: C.text }}>−{inr(b.monthOut)}</Text></Text>
               <Pressable hitSlop={10} onPress={() => onViewEntries(a)}><Text style={{ color: C.gold, fontSize: 13 }}>Entries ›</Text></Pressable>
             </View>
+            {a.kind === 'bank' && (
+              <Pressable style={st.checkBtn} onPress={() => onCheck(a)} disabled={checkingId === a.id}>
+                <Text style={st.checkText}>{checkingId === a.id ? '⏳ Waiting for bank SMS…' : '📞 Check balance with bank'}</Text>
+              </Pressable>
+            )}
           </Pressable>
         );
       })}
@@ -114,10 +120,13 @@ function fromSuggestion(g: Suggestion): Partial<Account> {
 }
 
 /** Add or edit an account. `balanceNow` is today's figure, shown as a hint. */
-export function AccountSheet({ visible, account, draft, balanceNow, onSave, onDelete, onClose }: {
-  visible: boolean; account: Account | null; draft?: Partial<Account>; balanceNow?: number;
-  onSave: (a: Account) => void; onDelete: (a: Account) => void; onClose: () => void;
+export function AccountSheet({ visible, account, draft, balance, checking, onCheck, onSave, onDelete, onClose }: {
+  visible: boolean; account: Account | null; draft?: Partial<Account>; balance?: Balance; checking?: boolean;
+  onCheck?: (a: Account) => void; onSave: (a: Account) => void; onDelete: (a: Account) => void; onClose: () => void;
 }) {
+  const balanceNow = balance?.value;
+  const [showSteps, setShowSteps] = useState(false);
+  const [checkNo, setCheckNo] = useState('');
   const base = account ?? draft ?? {};
   const [kind, setKind] = useState<AccountKind>('bank');
   const [name, setName] = useState('');
@@ -130,6 +139,7 @@ export function AccountSheet({ visible, account, draft, balanceNow, onSave, onDe
     if (!visible) return;
     setKind(base.kind ?? 'bank'); setName(base.name ?? ''); setBank(base.bank ?? ''); setLast4(base.last4 ?? '');
     setLimit(base.limit ? String(base.limit) : ''); setBal(''); setAtm(base.atmToCash ?? true);
+    setCheckNo(base.checkNumber ?? ''); setShowSteps(false);
   }, [visible, account?.id, draft]);
 
   const parse = (v: string) => parseFloat(v.replace(/,/g, ''));
@@ -145,6 +155,7 @@ export function AccountSheet({ visible, account, draft, balanceNow, onSave, onDe
       last4: kind === 'cash' ? undefined : last4.replace(/\D/g, '').slice(-4) || undefined,
       limit: kind === 'card' && lim > 0 ? lim : undefined,
       atmToCash: kind === 'cash' ? atm : undefined,
+      checkNumber: kind === 'bank' && checkNo.replace(/[^\d+]/g, '') ? checkNo.replace(/[^\d+]/g, '') : undefined,
       opening: bal.trim() && !isNaN(b) ? b : account?.opening ?? 0,
       openingAt: bal.trim() && !isNaN(b) ? Date.now() : account?.openingAt ?? 0,
     };
@@ -162,7 +173,36 @@ export function AccountSheet({ visible, account, draft, balanceNow, onSave, onDe
       <Btn label="Cancel" onPress={onClose} />
       <Btn label="Save" onPress={save} primary />
     </>}>
-      <Text style={s.h2}>{account ? 'Edit account' : 'Add account'}</Text>
+      <Text style={s.h2}>{account ? account.name : 'Add account'}</Text>
+      {account && balance && (
+        <View style={st.breakdown}>
+          <Text style={s.label}>{account.kind === 'card' ? 'AMOUNT DUE' : 'BALANCE NOW'}</Text>
+          <Text style={st.accBal}>{inr(balance.value, true)}</Text>
+          <Text style={[s.mute, { marginTop: 4 }]}>
+            Started from {inr(balance.value - balance.steps.reduce((x, y) => x + y.amount, 0), true)}{' '}
+            {balance.source === 'bank' ? `in a bank SMS, ${fmtDate(balance.sourceAt)}` : account.openingAt ? `that you set, ${fmtDate(account.openingAt)}` : '(no balance set yet)'}
+            {balance.steps.length ? `, then ${balance.steps.length} entr${balance.steps.length > 1 ? 'ies' : 'y'}` : ''}
+          </Text>
+          {balance.steps.length > 0 && (
+            <Pressable onPress={() => setShowSteps(!showSteps)} hitSlop={8}>
+              <Text style={{ color: C.gold, marginTop: 6, fontSize: 13 }}>{showSteps ? 'Hide' : 'Show'} how this was worked out</Text>
+            </Pressable>
+          )}
+          {showSteps && balance.steps.map(x => (
+            <View key={x.id} style={st.stepRow}>
+              <Text style={[s.mute, { width: 92 }]}>{fmtDate(x.date)}</Text>
+              <Text style={[s.body, { fontSize: 13 }]} numberOfLines={1}>{x.label}</Text>
+              <Text style={{ color: x.amount >= 0 ? C.green : C.text, fontSize: 13 }}>{x.amount >= 0 ? '+' : '−'}{inr(Math.abs(x.amount), true)}</Text>
+            </View>
+          ))}
+          {account.kind === 'bank' && onCheck && (
+            <Pressable style={st.checkBtn} onPress={() => onCheck(account)} disabled={checking}>
+              <Text style={st.checkText}>{checking ? '⏳ Waiting for bank SMS…' : '📞 Check balance with bank'}</Text>
+            </Pressable>
+          )}
+          <Text style={[s.mute, { marginTop: 6 }]}>Wrong? Type the correct balance below and Save.</Text>
+        </View>
+      )}
       <View style={[s.catGrid, { marginBottom: 12 }]}>
         {(Object.keys(KINDS) as AccountKind[]).map(k => (
           <Chip key={k} label={`${KINDS[k].icon} ${KINDS[k].label}`} on={kind === k} onPress={() => setKind(k)} />
@@ -174,6 +214,13 @@ export function AccountSheet({ visible, account, draft, balanceNow, onSave, onDe
           <TextInput style={[s.input, { flex: 1.4 }]} placeholder={kind === 'wallet' ? 'Provider (e.g. Paytm)' : 'Bank (e.g. Federal)'} placeholderTextColor={C.mute} value={bank} onChangeText={setBank} maxLength={20} />
           <TextInput style={[s.input, { flex: 1 }]} placeholder="Last 4 digits" placeholderTextColor={C.mute} value={last4} onChangeText={setLast4} keyboardType="number-pad" maxLength={6} />
         </View>
+      )}
+      {kind === 'bank' && (
+        <>
+          <Text style={s.label}>BALANCE CHECK NUMBER (MISSED CALL)</Text>
+          <TextInput style={s.input} value={checkNo} onChangeText={setCheckNo} keyboardType="phone-pad" placeholderTextColor={C.mute}
+            placeholder={(() => { const k = Object.keys(BALANCE_NUMBERS).find(b => b.toLowerCase() === bank.trim().toLowerCase()); return k ? `${BALANCE_NUMBERS[k]} (${k} default)` : 'Your bank’s missed-call number'; })()} />
+        </>
       )}
       {card && (
         <TextInput style={s.input} placeholder="Credit limit (₹)" placeholderTextColor={C.mute} value={limit} onChangeText={setLimit} keyboardType="decimal-pad" />
@@ -217,5 +264,9 @@ export function AccountPicker({ accounts, value, onPick, allowNone }: {
 const st = StyleSheet.create({
   accTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   accBal: { color: C.text, fontSize: 20, fontWeight: '700' },
+  checkBtn: { marginTop: 10, borderWidth: 1, borderColor: C.goldDeep, borderRadius: 10, paddingVertical: 9, alignItems: 'center' },
+  checkText: { color: C.gold, fontWeight: '600', fontSize: 13 },
+  breakdown: { backgroundColor: C.card2, borderRadius: 12, padding: 12, marginBottom: 14, borderWidth: 1, borderColor: C.line },
+  stepRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: C.line },
   accFoot: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.line },
 });

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Pressable, ScrollView, Share,
+  ActivityIndicator, Alert, AppState, FlatList, Keyboard, Linking, Pressable, ScrollView, Share,
   StyleSheet, Switch, Text, TextInput, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
@@ -11,7 +11,7 @@ import {
 } from './src/categories';
 import { ensureSmsPermission, readInbox } from './src/sms';
 import {
-  applyRule, BackupState, loadAccounts, loadAll, loadBackupState, loadMail, MailState, mergeTxns, replaceAll, Rules, saveBackupState,
+  applyRule, BackupState, loadAccounts, loadAll, loadBalanceAlerts, saveBalanceAlerts, loadBackupState, loadMail, MailState, mergeTxns, replaceAll, Rules, saveBackupState,
   saveAccounts, saveCats, saveLastScan, saveMail, saveRules, saveTxns, snapshot,
 } from './src/storage';
 import { File, Paths } from 'expo-file-system';
@@ -23,7 +23,8 @@ import { ensureScope, SCOPES } from './src/google';
 import { connectGmail, disconnectGmail, fetchBankEmails } from './src/gmail';
 import { ago, C, fmtDate, fmtDay, inr, monthLabel } from './src/ui';
 import { Btn, Chip, s, Sheet, Stat, TabBtn } from './src/kit';
-import { Account, accountFor, balanceOf, markSelfTransfers, reported } from './src/accounts';
+import { Account, accountFor, alertMatches, BalanceAlert, balanceOf, markSelfTransfers, parseBalanceAlert, reported } from './src/accounts';
+import { checkNumberFor } from './src/balanceCheck';
 import { AccountPicker, AccountSheet, AccountsTab } from './src/AccountsView';
 
 const DAY = 86400000;
@@ -74,6 +75,10 @@ function Main() {
   const accountsRef = useRef<Account[]>([]);
   const [accSheet, setAccSheet] = useState<{ account: Account | null; draft?: Partial<Account> } | null>(null);
   const [accFilter, setAccFilter] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<BalanceAlert[]>([]);
+  const alertsRef = useRef<BalanceAlert[]>([]);
+  const [checking, setChecking] = useState<{ accountId: string; since: number } | null>(null);
+  const latest = useRef({ txns: [] as Txn[], rules: {} as Rules, lastScan: 0 });
   /** Re-checks which entries are moves between your own accounts (left out of totals). */
   const withTransfers = (list: Txn[]) => markSelfTransfers(list, accountsRef.current);
 
@@ -87,7 +92,16 @@ function Main() {
       }
       const from = baseLast ? baseLast - 2 * DAY : Date.now() - FIRST_SCAN_DAYS * DAY;
       const sms = await readInbox(from);
-      const parsed = sms.map(parseSms).filter((t): t is Txn => !!t).map(t => applyRule(t, baseRules));
+      const results = sms.map(parseSms);
+      const parsed = results.filter((t): t is Txn => !!t).map(t => applyRule(t, baseRules));
+      // Balance-only messages (e.g. the bank's reply to a balance check) correct account balances.
+      const seenAlerts = new Set(alertsRef.current.map(a => a.id));
+      const fresh = sms.filter((_, i) => !results[i]).map(parseBalanceAlert).filter((a): a is BalanceAlert => !!a && !seenAlerts.has(a.id));
+      if (fresh.length) {
+        const nextAlerts = [...fresh, ...alertsRef.current].sort((x, y) => y.date - x.date).slice(0, 300);
+        alertsRef.current = nextAlerts; setAlerts(nextAlerts);
+        await saveBalanceAlerts(nextAlerts);
+      }
       const { merged: m0, added } = mergeTxns(base, parsed);
       const merged = withTransfers(m0);
       const now = Date.now();
@@ -248,6 +262,8 @@ function Main() {
       let d, m, b: BackupState, accs: Account[];
       try {
         [d, m, b, accs] = await Promise.all([loadAll(), loadMail(), loadBackupState(), loadAccounts()]);
+        const al = await loadBalanceAlerts();
+        alertsRef.current = al; setAlerts(al);
       } catch (e: any) {
         Alert.alert('Could not open saved data', String(e?.message ?? e));
         return;
@@ -263,6 +279,52 @@ function Main() {
       if (b.enabled && Date.now() - b.lastBackup > 7 * DAY) await runBackup(b, true);
     })();
   }, [runScan, runMail, runBackup]);
+
+  latest.current = { txns, rules, lastScan };
+
+  // ---------- Balance check (missed call; the bank replies by SMS) ----------
+  const onCheckBalance = async (a: Account) => {
+    const number = checkNumberFor(a);
+    if (!number) {
+      Alert.alert('No balance check number', `Add ${a.bank ?? 'your bank'}’s missed-call balance number in this account’s settings (tap the account).`);
+      return;
+    }
+    Alert.alert('Check balance', `Kanakku will open your phone dialer with ${number}. Call it from the phone number registered with ${a.bank ?? 'the bank'}; the call cuts by itself and the bank sends an SMS with your balance. Kanakku reads it when you come back.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Open dialer', onPress: async () => {
+          setChecking({ accountId: a.id, since: Date.now() - 60_000 });
+          try { await Linking.openURL(`tel:${number}`); } catch { Alert.alert('Could not open the dialer'); setChecking(null); }
+        },
+      },
+    ]);
+  };
+
+  // While waiting for the bank's reply, re-read messages every 15 seconds for up to 3 minutes.
+  useEffect(() => {
+    if (!checking) return;
+    const acc = accountsRef.current.find(x => x.id === checking.accountId);
+    if (!acc) { setChecking(null); return; }
+    let tries = 0;
+    const found = (list: Txn[]) =>
+      alertsRef.current.find(x => x.date >= checking.since && alertMatches(x, acc))
+      ?? list.find(t => t.date >= checking.since && accountFor(t, accountsRef.current)?.id === acc.id && reported(t).balance != null);
+    const timer = setInterval(async () => {
+      if (AppState.currentState !== 'active') return;
+      tries++;
+      const { txns: base, rules: r, lastScan: ls } = latest.current;
+      const list = await runScan(base, r, ls || Date.now() - DAY, true);
+      if (found(list)) {
+        clearInterval(timer); setChecking(null);
+        const b = balanceOf(acc, list, accountsRef.current, 0, 1, alertsRef.current);
+        Alert.alert(`${acc.name} updated`, `Balance as per the bank: ${inr(b.value, true)}`);
+      } else if (tries >= 12) {
+        clearInterval(timer); setChecking(null);
+        Alert.alert('No reply from the bank yet', 'If the SMS arrives later, Kanakku will use it the next time it reads your messages. Check that you called from the number registered with the bank.');
+      }
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [checking, runScan]);
 
   // Re-scan when the app comes back to the foreground.
   useEffect(() => {
@@ -530,7 +592,8 @@ function Main() {
           </View>
         </ScrollView>
       ) : tab === 'accounts' ? (
-        <AccountsTab accounts={accounts} txns={txns} monthStart={month} monthEnd={shiftMonth(month, 1)}
+        <AccountsTab accounts={accounts} txns={txns} alerts={alerts} monthStart={month} monthEnd={shiftMonth(month, 1)}
+          checkingId={checking?.accountId} onCheck={onCheckBalance}
           onOpen={a => setAccSheet({ account: a })} onAdd={draft => setAccSheet({ account: null, draft })}
           onViewEntries={a => { setAccFilter(a.id); setCatFilter(null); setFilter('all'); setTab('txns'); }} />
       ) : (
@@ -584,7 +647,8 @@ function Main() {
         ))}
       </Sheet>
       <AccountSheet visible={!!accSheet} account={accSheet?.account ?? null} draft={accSheet?.draft}
-        balanceNow={accSheet?.account ? balanceOf(accSheet.account, txns, accounts, month, shiftMonth(month, 1)).value : undefined}
+        balance={accSheet?.account ? balanceOf(accSheet.account, txns, accounts, month, shiftMonth(month, 1), alerts) : undefined}
+        checking={!!checking && checking.accountId === accSheet?.account?.id} onCheck={a => { setAccSheet(null); onCheckBalance(a); }}
         onSave={onSaveAccount} onDelete={onDeleteAccount} onClose={() => setAccSheet(null)} />
       <NewCategorySheet visible={!!newCat} income={newCat?.income ?? false} allowTypeSwitch={newCat?.switchable} onAdd={addCategory}
         onDone={name => { const cb = newCat?.onCreated; setNewCat(null); if (name && cb) cb(name); }} />
